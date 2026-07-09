@@ -13,6 +13,7 @@
 # limitations under the License.
 import abc
 import builtins
+import importlib
 import json
 import os
 import tempfile
@@ -35,6 +36,11 @@ from .types import FeatureType, PolicyFeature
 
 T = TypeVar("T", bound="PreTrainedConfig")
 logger = getLogger(__name__)
+
+
+def _ensure_policy_config_registered(policy_type: str) -> None:
+    if policy_type == "pi05":
+        importlib.import_module("lerobot.policies.pi05.configuration_pi05")
 
 
 @dataclass
@@ -205,18 +211,22 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
                     f"{CONFIG_NAME} not found on the HuggingFace Hub in {model_id}"
                 ) from e
 
+        if config_file is None:
+            raise FileNotFoundError(f"{CONFIG_NAME} not found in {model_id}")
+
+        with open(config_file) as f:
+            config = json.load(f)
+
+        policy_type = config.get("type")
+        if isinstance(policy_type, str):
+            _ensure_policy_config_registered(policy_type)
+
         # HACK: Parse the original config to get the config subclass, so that we can
         # apply cli overrides.
         # This is very ugly, ideally we'd like to be able to do that natively with draccus
         # something like --policy.path (in addition to --policy.type)
         with draccus.config_type("json"):
             orig_config = draccus.parse(cls, config_file, args=[])
-
-        if config_file is None:
-            raise FileNotFoundError(f"{CONFIG_NAME} not found in {model_id}")
-
-        with open(config_file) as f:
-            config = json.load(f)
 
         config.pop("type")
         with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".json") as f:

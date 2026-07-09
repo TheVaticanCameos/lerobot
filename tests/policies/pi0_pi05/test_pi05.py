@@ -150,7 +150,7 @@ def test_config_creation():
     """Test policy config creation through factory."""
     try:
         config = make_policy_config(
-            policy_type="pi0",
+            policy_type="pi05",
             max_action_dim=7,
             max_state_dim=14,
         )

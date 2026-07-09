@@ -51,6 +51,21 @@ else:
     AutoTokenizer = None
 
 
+def _from_pretrained_preferring_local(loader: Any, name: str, **kwargs: Any) -> Any:
+    """Load from the HF cache first, then fall back to the network if needed."""
+    try:
+        return loader.from_pretrained(name, local_files_only=True, **kwargs)
+    except Exception:
+        try:
+            return loader.from_pretrained(name, **kwargs)
+        except Exception as remote_error:
+            raise RuntimeError(
+                f"Failed to load '{name}' from the local Hugging Face cache, and downloading it also failed. "
+                "If this machine has no network access, make sure all tokenizer/processor files are cached "
+                "locally before running again."
+            ) from remote_error
+
+
 @dataclass
 @ProcessorStepRegistry.register(name="tokenizer_processor")
 class TokenizerProcessorStep(ObservationProcessorStep):
@@ -108,7 +123,7 @@ class TokenizerProcessorStep(ObservationProcessorStep):
         elif self.tokenizer_name is not None:
             if AutoTokenizer is None:
                 raise ImportError("AutoTokenizer is not available")
-            self.input_tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name)
+            self.input_tokenizer = _from_pretrained_preferring_local(AutoTokenizer, self.tokenizer_name)
         else:
             raise ValueError(
                 "Either 'tokenizer' or 'tokenizer_name' must be provided. "
@@ -376,8 +391,10 @@ class ActionTokenizerProcessorStep(ActionProcessorStep):
         elif self.action_tokenizer_name is not None:
             if AutoProcessor is None:
                 raise ImportError("AutoProcessor is not available")
-            self.action_tokenizer = AutoProcessor.from_pretrained(
-                self.action_tokenizer_name, trust_remote_code=self.trust_remote_code
+            self.action_tokenizer = _from_pretrained_preferring_local(
+                AutoProcessor,
+                self.action_tokenizer_name,
+                trust_remote_code=self.trust_remote_code,
             )
         else:
             raise ValueError(
@@ -385,7 +402,8 @@ class ActionTokenizerProcessorStep(ActionProcessorStep):
                 "Pass a tokenizer object directly or a tokenizer name to auto-load."
             )
 
-        self._paligemma_tokenizer = AutoTokenizer.from_pretrained(
+        self._paligemma_tokenizer = _from_pretrained_preferring_local(
+            AutoTokenizer,
             self.paligemma_tokenizer_name,
             trust_remote_code=self.trust_remote_code,
             add_eos_token=True,

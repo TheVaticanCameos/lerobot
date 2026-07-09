@@ -25,6 +25,9 @@ from .policies import PreTrainedConfig
 
 logger = getLogger(__name__)
 
+_LIBERO_MAX_CONCURRENT_ENVS = 16
+_STATEFUL_CHUNKED_POLICIES = {"pi0", "pi05"}
+
 
 @dataclass
 class EvalPipelineConfig:
@@ -72,6 +75,37 @@ class EvalPipelineConfig:
             now = dt.datetime.now()
             eval_dir = f"{now:%Y-%m-%d}/{now:%H-%M-%S}_{self.job_name}"
             self.output_dir = Path("outputs/eval") / eval_dir
+
+        self._validate_env_parallelism()
+
+    def _validate_env_parallelism(self) -> None:
+        if self.env is None or self.env.type not in {"libero", "libero_plus"}:
+            return
+
+        if (
+            self.policy is not None
+            and self.policy.type in _STATEFUL_CHUNKED_POLICIES
+            and self.env.max_parallel_tasks > 1
+        ):
+            raise ValueError(
+                f"{self.policy.type} keeps per-rollout action queue state inside the policy, so "
+                "LIBERO task-level threading would share mutable policy state across tasks. Use "
+                "--env.max_parallel_tasks=1 and increase --eval.batch_size instead."
+            )
+
+        concurrent_envs = self.eval.batch_size * max(1, self.env.max_parallel_tasks)
+        if concurrent_envs <= _LIBERO_MAX_CONCURRENT_ENVS:
+            return
+
+        raise ValueError(
+            "LIBERO evaluation would start too many MuJoCo worker environments at once "
+            f"({self.eval.batch_size} eval.batch_size * {self.env.max_parallel_tasks} "
+            f"env.max_parallel_tasks = {concurrent_envs}). This commonly exhausts EGL/MuJoCo "
+            "resources and shows up as AsyncVectorEnv EOFError/BrokenPipeError. Lower "
+            f"eval.batch_size or env.max_parallel_tasks so the product is <= {_LIBERO_MAX_CONCURRENT_ENVS}. "
+            "For Pi0/Pi0.5 LIBERO eval, use --env.max_parallel_tasks=1 and raise "
+            "--eval.batch_size only as high as your machine can support."
+        )
 
     @classmethod
     def __get_path_fields__(cls) -> list[str]:

@@ -443,6 +443,85 @@ class LiberoEnv(EnvConfig):
         )
 
 
+@EnvConfig.register_subclass("scene1_libero")
+@dataclass
+class Scene1LiberoEnv(EnvConfig):
+    task: str = "scene1_libero"
+    scene_task: str = "pick_magnifying_glass"
+    bddl_path: str | None = None
+    assets_root: str = "data/mujoco_scene1_libero/assets"
+    prompt: str | None = None
+    fps: int = 30
+    episode_length: int = 280
+    obs_type: str = "pixels_agent_pos"
+    render_mode: str = "rgb_array"
+    camera_name: str = "agentview_image,robot0_eye_in_hand_image"
+    camera_name_mapping: dict[str, str] | None = None
+    observation_height: int = 360
+    observation_width: int = 360
+    control_mode: str = "relative"
+    features: dict[str, PolicyFeature] = field(
+        default_factory=lambda: {
+            ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,)),
+            LIBERO_KEY_PIXELS_AGENTVIEW: PolicyFeature(type=FeatureType.VISUAL, shape=(360, 360, 3)),
+            LIBERO_KEY_PIXELS_EYE_IN_HAND: PolicyFeature(type=FeatureType.VISUAL, shape=(360, 360, 3)),
+            LIBERO_KEY_EEF_POS: PolicyFeature(type=FeatureType.STATE, shape=(3,)),
+            LIBERO_KEY_EEF_QUAT: PolicyFeature(type=FeatureType.STATE, shape=(4,)),
+            LIBERO_KEY_EEF_MAT: PolicyFeature(type=FeatureType.STATE, shape=(3, 3)),
+            LIBERO_KEY_GRIPPER_QPOS: PolicyFeature(type=FeatureType.STATE, shape=(2,)),
+            LIBERO_KEY_GRIPPER_QVEL: PolicyFeature(type=FeatureType.STATE, shape=(2,)),
+            LIBERO_KEY_JOINTS_POS: PolicyFeature(type=FeatureType.STATE, shape=(7,)),
+            LIBERO_KEY_JOINTS_VEL: PolicyFeature(type=FeatureType.STATE, shape=(7,)),
+        }
+    )
+    features_map: dict[str, str] = field(
+        default_factory=lambda: {
+            ACTION: ACTION,
+            LIBERO_KEY_EEF_POS: f"{OBS_STATE}.eef_pos",
+            LIBERO_KEY_EEF_QUAT: f"{OBS_STATE}.eef_quat",
+            LIBERO_KEY_EEF_MAT: f"{OBS_STATE}.eef_mat",
+            LIBERO_KEY_GRIPPER_QPOS: f"{OBS_STATE}.gripper_qpos",
+            LIBERO_KEY_GRIPPER_QVEL: f"{OBS_STATE}.gripper_qvel",
+            LIBERO_KEY_JOINTS_POS: f"{OBS_STATE}.joint_pos",
+            LIBERO_KEY_JOINTS_VEL: f"{OBS_STATE}.joint_vel",
+            LIBERO_KEY_PIXELS_AGENTVIEW: f"{OBS_IMAGES}.image",
+            LIBERO_KEY_PIXELS_EYE_IN_HAND: f"{OBS_IMAGES}.image2",
+        }
+    )
+
+    @property
+    def gym_kwargs(self) -> dict:
+        return {
+            "obs_type": self.obs_type,
+            "render_mode": self.render_mode,
+            "episode_length": self.episode_length,
+            "camera_name": self.camera_name,
+            "camera_name_mapping": self.camera_name_mapping,
+            "observation_height": self.observation_height,
+            "observation_width": self.observation_width,
+            "control_mode": self.control_mode,
+        }
+
+    def create_envs(self, n_envs: int, use_async_envs: bool = False):
+        from .scene1_libero import create_scene1_libero_envs
+
+        return create_scene1_libero_envs(
+            n_envs=n_envs,
+            env_cls=_make_vec_env_cls(use_async_envs, n_envs),
+            scene_task=self.scene_task,
+            assets_root=self.assets_root,
+            bddl_path=self.bddl_path,
+            prompt=self.prompt,
+            gym_kwargs=self.gym_kwargs,
+        )
+
+    def get_env_processors(self):
+        return (
+            PolicyProcessorPipeline(steps=[LiberoProcessorStep()]),
+            PolicyProcessorPipeline(steps=[]),
+        )
+
+
 @EnvConfig.register_subclass("metaworld")
 @dataclass
 class MetaworldEnv(EnvConfig):

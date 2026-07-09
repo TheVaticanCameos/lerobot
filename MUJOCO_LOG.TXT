@@ -1,0 +1,9 @@
+Sun Jun 28 20:41:53 2026
+WARNING: OpenGL error 0x505 in or before mjr_makeContext
+
+Sun Jun 28 20:41:54 2026
+WARNING: OpenGL error 0x505 in or before mjr_makeContext
+
+Sun Jun 28 20:41:54 2026
+WARNING: OpenGL error 0x505 in or before mjr_makeContext
+
