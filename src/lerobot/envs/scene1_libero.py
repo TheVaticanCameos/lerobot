@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import re
 from collections.abc import Callable, Mapping, Sequence
@@ -11,13 +12,13 @@ from pathlib import Path
 from typing import Any
 
 import gymnasium as gym
+import libero.libero.envs.problems.libero_tabletop_manipulation  # noqa: F401
 import numpy as np
 from gymnasium import spaces
 from libero.libero.envs import OffScreenRenderEnv
 from libero.libero.envs.base_object import OBJECTS_DICT, register_object
 from libero.libero.envs.bddl_base_domain import TASK_MAPPING, register_problem
 from libero.libero.envs.regions import REGION_SAMPLERS
-import libero.libero.envs.problems.libero_tabletop_manipulation  # noqa: F401
 from robosuite.models.objects import MujocoXMLObject
 
 from lerobot.types import RobotObservation
@@ -25,10 +26,7 @@ from lerobot.types import RobotObservation
 from .libero import ACTION_DIM, ACTION_HIGH, ACTION_LOW, get_libero_dummy_action
 from .utils import parse_camera_names
 
-
-DEFAULT_ASSETS_ROOT = (
-    Path(__file__).resolve().parents[3] / "data" / "mujoco_scene1_libero" / "assets"
-)
+DEFAULT_ASSETS_ROOT = Path(__file__).resolve().parents[3] / "data" / "mujoco_scene1_libero" / "assets"
 DEFAULT_BDDL_ROOT = Path(__file__).resolve().parents[3] / "data" / "mujoco_scene1_libero" / "bddl"
 
 
@@ -38,6 +36,7 @@ class Scene1TaskSpec:
     prompt: str
     bddl_file: str
     target_object: str
+    layout: str = "original"
 
 
 SCENE1_TASKS: dict[str, Scene1TaskSpec] = {
@@ -52,6 +51,13 @@ SCENE1_TASKS: dict[str, Scene1TaskSpec] = {
         prompt="pick up the magnifying glass",
         bddl_file="scene1_pick_magnifying_glass.bddl",
         target_object="scene1_fying_glass_1",
+    ),
+    "pick_magnifying_glass_cluttered": Scene1TaskSpec(
+        key="pick_magnifying_glass_cluttered",
+        prompt="pick up the magnifying glass",
+        bddl_file="scene1_pick_magnifying_glass_cluttered.bddl",
+        target_object="scene1_fying_glass_1",
+        layout="cluttered_red_cars_magnifying_glass",
     ),
     "pick_gray_box": Scene1TaskSpec(
         key="pick_gray_box",
@@ -71,6 +77,37 @@ SCENE1_ORIGINAL_XY: dict[str, tuple[float, float]] = {
     "scene1_bottle_4_1": (0.38229599599999997, 0.18590948699999998),
     "scene1_bottle_5_1": (0.266199991, 0.164800003),
     "scene1_bottle_6_1": (0.29869999, 0.21510000499999998),
+}
+
+
+@dataclass(frozen=True)
+class Scene1ObjectPose:
+    x: float
+    y: float
+    z_offset: float = 0.0
+    roll: float = 0.0
+    pitch: float = 0.0
+    yaw: float = 0.0
+
+
+SCENE1_CLUTTERED_RED_CARS_MAGNIFYING_GLASS: dict[str, Scene1ObjectPose] = {
+    "scene1_fying_glass_1": Scene1ObjectPose(x=0.125, y=-0.085, yaw=math.radians(18.0)),
+    "scene1_toy_car_8_1": Scene1ObjectPose(
+        x=0.105,
+        y=-0.085,
+        z_offset=0.035,
+        yaw=math.radians(28.0),
+    ),
+    "scene1_toy_car_2_1": Scene1ObjectPose(
+        x=0.115,
+        y=-0.085,
+        z_offset=0.115,
+        yaw=math.radians(-32.0),
+    ),
+}
+
+SCENE1_LAYOUTS: dict[str, dict[str, Scene1ObjectPose]] = {
+    "cluttered_red_cars_magnifying_glass": SCENE1_CLUTTERED_RED_CARS_MAGNIFYING_GLASS,
 }
 
 
@@ -110,7 +147,7 @@ class Scene1Object(MujocoXMLObject):
 
     def __init__(self, name: str, joints: list[dict[str, str]] | None = None):
         if joints is None:
-            joints = [dict(type="free", damping="0.0005")]
+            joints = [{"type": "free", "damping": "0.0005"}]
         super().__init__(
             str(_assets_root() / "scene1_objects" / self.object_category / f"{self.object_category}.xml"),
             name=name,
@@ -231,7 +268,7 @@ OBJECTS_DICT.update(
 )
 
 
-class Scene1_Tabletop_Manipulation(TASK_MAPPING["libero_tabletop_manipulation"]):
+class Scene1_Tabletop_Manipulation(TASK_MAPPING["libero_tabletop_manipulation"]):  # noqa: N801
     """LIBERO tabletop task with scene-1 movable objects.
 
     The BDDL goal is intentionally simple; for evaluation we use a physical
@@ -244,7 +281,8 @@ class Scene1_Tabletop_Manipulation(TASK_MAPPING["libero_tabletop_manipulation"])
 
     def _check_success(self):
         height = self._object_height(self._scene1_target_object or "scene1_fying_glass_1")
-        return height is not None and height > 0.98
+        # return height is not None and height > 0.98
+        return height is not None and height > 1.0
 
     def _object_height(self, name_fragment: str) -> float | None:
         try:
@@ -283,6 +321,7 @@ class Scene1LiberoEnv(gym.Env):
         num_steps_wait: int = 10,
         control_mode: str = "relative",
         task_id: int = 0,
+        layout: str = "original",
     ):
         super().__init__()
         os.environ["LEROBOT_SCENE1_LIBERO_ASSETS"] = str(Path(assets_root).expanduser().resolve())
@@ -298,6 +337,7 @@ class Scene1LiberoEnv(gym.Env):
         self.num_steps_wait = num_steps_wait
         self._max_episode_steps = episode_length
         self.control_mode = control_mode
+        self.layout = layout
         self._env: OffScreenRenderEnv | None = None
 
         if camera_name_mapping is None:
@@ -343,7 +383,9 @@ class Scene1LiberoEnv(gym.Env):
                 ),
             }
         )
-        self.action_space = spaces.Box(low=ACTION_LOW, high=ACTION_HIGH, shape=(ACTION_DIM,), dtype=np.float32)
+        self.action_space = spaces.Box(
+            low=ACTION_LOW, high=ACTION_HIGH, shape=(ACTION_DIM,), dtype=np.float32
+        )
 
     def _ensure_env(self) -> None:
         if self._env is not None:
@@ -372,6 +414,47 @@ class Scene1LiberoEnv(gym.Env):
             sim.data.qpos[qpos_addr + 1] = y
             sim.data.qpos[qpos_addr + 3 : qpos_addr + 7] = np.array([1.0, 0.0, 0.0, 0.0])
         sim.forward()
+
+    @staticmethod
+    def _pose_quaternion(pose: Scene1ObjectPose) -> np.ndarray:
+        cr = math.cos(pose.roll / 2.0)
+        sr = math.sin(pose.roll / 2.0)
+        cp = math.cos(pose.pitch / 2.0)
+        sp = math.sin(pose.pitch / 2.0)
+        cy = math.cos(pose.yaw / 2.0)
+        sy = math.sin(pose.yaw / 2.0)
+        return np.array(
+            [
+                cr * cp * cy + sr * sp * sy,
+                sr * cp * cy - cr * sp * sy,
+                cr * sp * cy + sr * cp * sy,
+                cr * cp * sy - sr * sp * cy,
+            ]
+        )
+
+    def _apply_cluttered_scene_layout(self) -> None:
+        assert self._env is not None
+        self._apply_original_scene_layout()
+        sim = self._env.sim
+        try:
+            layout = SCENE1_LAYOUTS[self.layout]
+        except KeyError as exc:
+            raise ValueError(f"Unknown Scene1 layout: {self.layout}") from exc
+
+        for object_name, pose in layout.items():
+            joint_name = f"{object_name}_joint0"
+            joint_id = sim.model.joint_name2id(joint_name)
+            qpos_addr = sim.model.jnt_qposadr[joint_id]
+            base_z = float(sim.data.qpos[qpos_addr + 2])
+            sim.data.qpos[qpos_addr : qpos_addr + 3] = np.array([pose.x, pose.y, base_z + pose.z_offset])
+            sim.data.qpos[qpos_addr + 3 : qpos_addr + 7] = self._pose_quaternion(pose)
+        sim.forward()
+
+    def _apply_initial_scene_layout(self) -> None:
+        if self.layout == "original":
+            self._apply_original_scene_layout()
+        else:
+            self._apply_cluttered_scene_layout()
 
     def _format_raw_obs(self, raw_obs: RobotObservation) -> RobotObservation:
         assert self._env is not None
@@ -410,10 +493,12 @@ class Scene1LiberoEnv(gym.Env):
         super().reset(seed=seed)
         self._env.seed(seed)
         raw_obs = self._env.reset()
-        self._apply_original_scene_layout()
-        for _ in range(self.num_steps_wait):
+        self._apply_initial_scene_layout()
+        settle_steps = max(self.num_steps_wait, 40) if self.layout != "original" else self.num_steps_wait
+        for _ in range(settle_steps):
             raw_obs, _, _, _ = self._env.step(get_libero_dummy_action())
-        self._apply_original_scene_layout()
+        if self.layout == "original":
+            self._apply_original_scene_layout()
         raw_obs = self._env.env._get_observations()
         if self.control_mode == "absolute":
             for robot in self._env.robots:
@@ -475,6 +560,7 @@ def create_scene1_libero_envs(
             assets_root=assets_root,
             prompt=prompt or spec.prompt,
             task_id=task_id,
+            layout=spec.layout,
             **kwargs,
         )
 
