@@ -58,6 +58,14 @@ from lerobot.utils.constants import (
 from ..pretrained import PreTrainedPolicy, T
 from ..rtc.modeling_rtc import RTCProcessor
 from .configuration_pi05 import DEFAULT_IMAGE_SIZE, PI05Config
+from .flow_sde import (
+    FlowSDETrace,
+    flow_ode_transition_mean,
+    flow_sde_transition_parameters,
+    gaussian_transition_log_prob,
+    make_flow_timesteps,
+    sample_flow_sde_transition,
+)
 
 
 class ActionSelectKwargs(TypedDict, total=False):
@@ -739,6 +747,35 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return embs, pad_masks, att_masks, adarms_cond
 
+    @torch.no_grad()
+    def _build_prefix_cache(self, images, img_masks, tokens, masks):
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+        vlm = self.paligemma_with_expert.paligemma
+        vlm.model.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+        was_training = vlm.training
+        vlm.eval()
+        try:
+            (prefix_output, _), past_key_values = self.paligemma_with_expert.forward(
+                attention_mask=prefix_att_2d_masks_4d,
+                position_ids=prefix_position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, None],
+                use_cache=True,
+            )
+        finally:
+            vlm.train(was_training)
+        return prefix_output, prefix_pad_masks, past_key_values
+
+    @staticmethod
+    def _pool_prefix_features(prefix_output: Tensor, prefix_pad_masks: Tensor) -> Tensor:
+        """Pool valid VLM prefix tokens for the pi0.5 observation-value critic."""
+        mask = prefix_pad_masks.to(prefix_output.dtype).unsqueeze(-1)
+        denominator = mask.sum(dim=1).clamp_min(1)
+        return (prefix_output * mask).sum(dim=1).div(denominator).to(torch.float32)
+
     def forward(self, images, img_masks, tokens, masks, actions, noise, time) -> Tensor:
         """Do a full training forward pass and compute the loss."""
         time_expanded = time[:, None, None]
@@ -867,6 +904,139 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
 
         return x_t
+
+    @torch.no_grad()
+    def sample_actions_with_flow_sde(
+        self,
+        images,
+        img_masks,
+        tokens,
+        masks,
+        noise=None,
+        num_steps=None,
+        noise_level=None,
+        action_dim=None,
+        prefix_horizon=None,
+    ) -> tuple[Tensor, FlowSDETrace]:
+        """Sample a full chunk with exactly one randomly selected Flow-SDE transition."""
+        if self._rtc_enabled():
+            raise ValueError("Hybrid Flow-SDE sampling cannot be combined with RTC")
+        if num_steps is None:
+            num_steps = self.config.num_inference_steps
+        if noise_level is None:
+            noise_level = self.config.flow_sde_noise_level
+        if action_dim is None:
+            action_dim = self.config.max_action_dim
+        if prefix_horizon is None:
+            prefix_horizon = self.config.chunk_size
+
+        bsize = tokens.shape[0]
+        device = tokens.device
+        if noise is None:
+            noise = self.sample_noise((bsize, self.config.chunk_size, self.config.max_action_dim), device)
+
+        prefix_output, prefix_pad_masks, past_key_values = self._build_prefix_cache(
+            images, img_masks, tokens, masks
+        )
+        value_features = self._pool_prefix_features(prefix_output, prefix_pad_masks)
+        timesteps = make_flow_timesteps(num_steps, device=device, dtype=torch.float32)
+        stochastic_steps = torch.randint(num_steps, (bsize,), device=device)
+        transition_noise = self.sample_noise(noise.shape, device)
+
+        x_t = noise
+        trace_x_before = torch.empty_like(x_t)
+        trace_x_after = torch.empty_like(x_t)
+        trace_timestep = torch.empty(bsize, device=device, dtype=timesteps.dtype)
+        trace_next_timestep = torch.empty_like(trace_timestep)
+        trace_mean = torch.empty_like(x_t)
+        trace_std = torch.empty_like(x_t)
+        for step in range(num_steps):
+            timestep = timesteps[step].expand(bsize)
+            next_timestep = timesteps[step + 1].expand(bsize)
+            v_t = self.denoise_step(prefix_pad_masks, past_key_values, x_t, timestep)
+            ode_next = flow_ode_transition_mean(x_t, v_t, timestep, next_timestep)
+            sde_next, mean, std = sample_flow_sde_transition(
+                x_t,
+                v_t,
+                timestep,
+                next_timestep,
+                noise_level,
+                transition_noise,
+            )
+            selected = stochastic_steps == step
+            selected_action = selected[:, None, None]
+            trace_x_before = torch.where(selected_action, x_t, trace_x_before)
+            trace_x_after = torch.where(selected_action, sde_next, trace_x_after)
+            trace_mean = torch.where(selected_action, mean, trace_mean)
+            trace_std = torch.where(selected_action, std, trace_std)
+            trace_timestep = torch.where(selected, timestep, trace_timestep)
+            trace_next_timestep = torch.where(selected, next_timestep, trace_next_timestep)
+            x_t = torch.where(selected_action, sde_next, ode_next)
+
+        old_log_prob = gaussian_transition_log_prob(
+            trace_x_after,
+            trace_mean,
+            trace_std,
+            action_dim=action_dim,
+            prefix_horizon=prefix_horizon,
+        )
+        trace = FlowSDETrace(
+            x_before=trace_x_before,
+            x_after=trace_x_after,
+            timestep=trace_timestep,
+            next_timestep=trace_next_timestep,
+            step_index=stochastic_steps,
+            num_steps=num_steps,
+            noise_level=float(noise_level),
+            action_dim=action_dim,
+            prefix_horizon=prefix_horizon,
+            old_log_prob=old_log_prob,
+            value_features=value_features,
+        )
+        return x_t, trace.detach(cpu=True)
+
+    def compute_flow_sde_log_prob(
+        self,
+        images,
+        img_masks,
+        tokens,
+        masks,
+        trace: FlowSDETrace,
+        *,
+        prefix_horizon: int | None = None,
+    ) -> Tensor:
+        """Differentiably recompute a stored Flow-SDE transition's current log-probability."""
+        if self._rtc_enabled():
+            raise ValueError("Hybrid Flow-SDE log-probability cannot be combined with RTC")
+        device = tokens.device
+        trace = trace.to(device)
+        _, prefix_pad_masks, past_key_values = self._build_prefix_cache(images, img_masks, tokens, masks)
+        velocity = self.denoise_step(
+            prefix_pad_masks,
+            past_key_values,
+            trace.x_before,
+            trace.timestep,
+        )
+        mean, std = flow_sde_transition_parameters(
+            trace.x_before,
+            velocity,
+            trace.timestep,
+            trace.next_timestep,
+            trace.noise_level,
+        )
+        return gaussian_transition_log_prob(
+            trace.x_after,
+            mean,
+            std,
+            action_dim=trace.action_dim,
+            prefix_horizon=trace.prefix_horizon if prefix_horizon is None else prefix_horizon,
+        )
+
+    @torch.no_grad()
+    def compute_value_features(self, images, img_masks, tokens, masks) -> Tensor:
+        """Return pooled frozen-VLM prefix features for an observation-value head."""
+        prefix_output, prefix_pad_masks, _ = self._build_prefix_cache(images, img_masks, tokens, masks)
+        return self._pool_prefix_features(prefix_output, prefix_pad_masks)
 
     def denoise_step(
         self,
@@ -1252,6 +1422,64 @@ class PI05Policy(PreTrainedPolicy):
 
         return actions
 
+    @torch.no_grad()
+    def predict_action_chunk_with_flow_sde(
+        self,
+        batch: dict[str, Tensor],
+        *,
+        noise: Tensor | None = None,
+        num_steps: int | None = None,
+        noise_level: float | None = None,
+        prefix_horizon: int | None = None,
+    ) -> tuple[Tensor, FlowSDETrace]:
+        """Predict a complete action chunk and retain its one stochastic transition."""
+        self.eval()
+        images, img_masks = self._preprocess_images(batch)
+        tokens, masks = batch[OBS_LANGUAGE_TOKENS], batch[OBS_LANGUAGE_ATTENTION_MASK]
+        action_dim = self.config.output_features[ACTION].shape[0]
+        if prefix_horizon is None:
+            prefix_horizon = self.config.n_action_steps
+
+        actions, trace = self.model.sample_actions_with_flow_sde(
+            images,
+            img_masks,
+            tokens,
+            masks,
+            noise=noise,
+            num_steps=num_steps,
+            noise_level=noise_level,
+            action_dim=action_dim,
+            prefix_horizon=prefix_horizon,
+        )
+        return actions[:, :, :action_dim], trace
+
+    def compute_flow_sde_log_prob(
+        self,
+        batch: dict[str, Tensor],
+        trace: FlowSDETrace,
+        *,
+        prefix_horizon: int | None = None,
+    ) -> Tensor:
+        """Differentiably evaluate a rollout trace under the policy's current parameters."""
+        images, img_masks = self._preprocess_images(batch)
+        tokens, masks = batch[OBS_LANGUAGE_TOKENS], batch[OBS_LANGUAGE_ATTENTION_MASK]
+        return self.model.compute_flow_sde_log_prob(
+            images,
+            img_masks,
+            tokens,
+            masks,
+            trace,
+            prefix_horizon=prefix_horizon,
+        )
+
+    @torch.no_grad()
+    def compute_value_features(self, batch: dict[str, Tensor]) -> Tensor:
+        """Return pooled VLM-prefix features for an external PPO value head."""
+        self.eval()
+        images, img_masks = self._preprocess_images(batch)
+        tokens, masks = batch[OBS_LANGUAGE_TOKENS], batch[OBS_LANGUAGE_ATTENTION_MASK]
+        return self.model.compute_value_features(images, img_masks, tokens, masks)
+
     def forward(self, batch: dict[str, Tensor], reduction: str = "mean") -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training.
 
@@ -1294,9 +1522,7 @@ class PI05Policy(PreTrainedPolicy):
 
     def _get_default_peft_targets(self) -> dict[str, any]:
         """Return default PEFT target modules for PI0.5 fine-tuning."""
-        common_projections = (
-            "state_proj|action_in_proj|action_out_proj|action_time_mlp_in|action_time_mlp_out"
-        )
+        common_projections = "action_in_proj|action_out_proj|time_mlp_in|time_mlp_out"
         target_modules = rf"(.*\.gemma_expert\..*\.self_attn\.(q|v)_proj|model\.({common_projections}))"
         return {
             "target_modules": target_modules,

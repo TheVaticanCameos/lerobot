@@ -15,7 +15,8 @@
 # limitations under the License.
 
 from .configuration_pi05 import PI05Config
+from .flow_sde import FlowSDETrace
 from .modeling_pi05 import PI05Policy
 from .processor_pi05 import make_pi05_pre_post_processors
 
-__all__ = ["PI05Config", "PI05Policy", "make_pi05_pre_post_processors"]
+__all__ = ["FlowSDETrace", "PI05Config", "PI05Policy", "make_pi05_pre_post_processors"]
