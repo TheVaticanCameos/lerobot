@@ -694,6 +694,10 @@ def eval_main(cfg: EvalPipelineConfig):
     # Create environment-specific preprocessor and postprocessor (e.g., for LIBERO environments)
     env_preprocessor, env_postprocessor = make_env_pre_post_processors(env_cfg=cfg.env, policy_cfg=cfg.policy)
 
+    # Policy and adapter construction may consume random numbers. Reset here so
+    # cfg.seed identifies the rollout sampling stream rather than load details.
+    set_seed(cfg.seed)
+
     recording_dir = Path(cfg.output_dir) / "recordings" if cfg.eval.recording else None
     max_episodes_rendered = 0 if cfg.eval.recording else 10
     videos_dir = None if cfg.eval.recording else Path(cfg.output_dir) / "videos"
