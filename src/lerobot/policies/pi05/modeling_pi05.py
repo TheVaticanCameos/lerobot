@@ -917,6 +917,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         noise_level=None,
         action_dim=None,
         prefix_horizon=None,
+        include_value_features=True,
     ) -> tuple[Tensor, FlowSDETrace]:
         """Sample a full chunk with exactly one randomly selected Flow-SDE transition."""
         if self._rtc_enabled():
@@ -938,7 +939,11 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         prefix_output, prefix_pad_masks, past_key_values = self._build_prefix_cache(
             images, img_masks, tokens, masks
         )
-        value_features = self._pool_prefix_features(prefix_output, prefix_pad_masks)
+        value_features = (
+            self._pool_prefix_features(prefix_output, prefix_pad_masks)
+            if include_value_features
+            else None
+        )
         timesteps = make_flow_timesteps(num_steps, device=device, dtype=torch.float32)
         stochastic_steps = torch.randint(num_steps, (bsize,), device=device)
         transition_noise = self.sample_noise(noise.shape, device)
@@ -1431,6 +1436,7 @@ class PI05Policy(PreTrainedPolicy):
         num_steps: int | None = None,
         noise_level: float | None = None,
         prefix_horizon: int | None = None,
+        include_value_features: bool = True,
     ) -> tuple[Tensor, FlowSDETrace]:
         """Predict a complete action chunk and retain its one stochastic transition."""
         self.eval()
@@ -1450,6 +1456,7 @@ class PI05Policy(PreTrainedPolicy):
             noise_level=noise_level,
             action_dim=action_dim,
             prefix_horizon=prefix_horizon,
+            include_value_features=include_value_features,
         )
         return actions[:, :, :action_dim], trace
 

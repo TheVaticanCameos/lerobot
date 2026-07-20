@@ -566,5 +566,10 @@ def create_scene1_libero_envs(
 
     for task_id, spec in enumerate(task_specs):
         fns = [partial(_make_env, spec, task_id, **gym_kwargs) for _ in range(n_envs)]
-        envs["scene1_libero"][task_id] = env_cls(fns)
+        if env_cls is gym.vector.AsyncVectorEnv:
+            envs["scene1_libero"][task_id] = env_cls(
+                fns, context="forkserver"
+            )
+        else:
+            envs["scene1_libero"][task_id] = env_cls(fns)
     return envs
