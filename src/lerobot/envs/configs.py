@@ -44,6 +44,8 @@ from lerobot.utils.constants import (
     OBS_STATE,
 )
 
+from .scene1_randomization import Scene1RandomizationConfig
+
 
 def _make_vec_env_cls(use_async: bool, n_envs: int):
     """Return the right VectorEnv constructor."""
@@ -460,6 +462,7 @@ class Scene1LiberoEnv(EnvConfig):
     observation_height: int = 360
     observation_width: int = 360
     control_mode: str = "relative"
+    domain_randomization: Scene1RandomizationConfig = field(default_factory=Scene1RandomizationConfig)
     features: dict[str, PolicyFeature] = field(
         default_factory=lambda: {
             ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,)),
@@ -500,6 +503,7 @@ class Scene1LiberoEnv(EnvConfig):
             "observation_height": self.observation_height,
             "observation_width": self.observation_width,
             "control_mode": self.control_mode,
+            "domain_randomization": self.domain_randomization,
         }
 
     def create_envs(self, n_envs: int, use_async_envs: bool = False):

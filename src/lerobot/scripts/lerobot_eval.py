@@ -111,6 +111,30 @@ def _env_features_to_dataset_features(env_features: dict) -> dict:
     return features
 
 
+def _json_serializable(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _json_serializable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_serializable(item) for item in value]
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def _get_episode_metadata(env: gym.vector.VectorEnv) -> list[dict[str, Any] | None]:
+    try:
+        metadata = list(env.call("get_episode_metadata"))
+    except (AttributeError, NotImplementedError):
+        return [None] * env.num_envs
+    if len(metadata) != env.num_envs:
+        raise RuntimeError(
+            f"get_episode_metadata returned {len(metadata)} entries for {env.num_envs} environments."
+        )
+    return [_json_serializable(item) if item is not None else None for item in metadata]
+
+
 def _build_raw_frame(
     raw_obs: dict,
     env_idx: int,
@@ -206,6 +230,7 @@ def rollout(
     # Reset the policy and environments.
     policy.reset()
     observation, info = env.reset(seed=seeds)
+    episode_metadata = _get_episode_metadata(env)
     if render_callback is not None:
         render_callback(env)
 
@@ -371,6 +396,7 @@ def rollout(
         "reward": torch.stack(all_rewards, dim=1),
         "success": torch.stack(all_successes, dim=1),
         "done": torch.stack(all_dones, dim=1),
+        "episode_metadata": episode_metadata,
     }
     if return_observations:
         stacked_observations = {}
@@ -442,8 +468,16 @@ def eval_policy(
     max_rewards = []
     all_successes = []
     all_seeds = []
+    all_episode_metadata = []
     threads = []  # for video saving threads
+    video_errors: list[BaseException] = []
     n_episodes_rendered = 0  # for saving the correct number of videos
+
+    def write_video_checked(path: str, frames: np.ndarray, fps: int) -> None:
+        try:
+            write_video(path, frames, fps)
+        except BaseException as error:
+            video_errors.append(error)
 
     # Callback for visualization.
     def render_frame(env: gym.vector.VectorEnv):
@@ -510,10 +544,11 @@ def eval_policy(
         max_rewards.extend(batch_max_rewards.tolist())
         batch_successes = einops.reduce((rollout_data["success"] * mask), "b n -> b", "any")
         all_successes.extend(batch_successes.tolist())
+        all_episode_metadata.extend(rollout_data["episode_metadata"])
         if seeds:
             all_seeds.extend(seeds)
         else:
-            all_seeds.append(None)
+            all_seeds.extend([None] * env.num_envs)
 
         # FIXME: episode_data is either None or it doesn't exist
         if return_episode_data:
@@ -546,7 +581,7 @@ def eval_policy(
                 video_path = videos_dir / f"eval_episode_{n_episodes_rendered}.mp4"
                 video_paths.append(str(video_path))
                 thread = threading.Thread(
-                    target=write_video,
+                    target=write_video_checked,
                     args=(
                         str(video_path),
                         stacked_frames[: done_index + 1],  # + 1 to capture the last observation
@@ -564,6 +599,8 @@ def eval_policy(
     # Wait till all video rendering threads are done.
     for thread in threads:
         thread.join()
+    if video_errors:
+        raise RuntimeError(f"Failed to encode {len(video_errors)} evaluation video(s).") from video_errors[0]
 
     # Compile eval info.
     info = {
@@ -574,13 +611,15 @@ def eval_policy(
                 "max_reward": max_reward,
                 "success": success,
                 "seed": seed,
+                "episode_metadata": episode_metadata,
             }
-            for i, (sum_reward, max_reward, success, seed) in enumerate(
+            for i, (sum_reward, max_reward, success, seed, episode_metadata) in enumerate(
                 zip(
                     sum_rewards[:n_episodes],
                     max_rewards[:n_episodes],
                     all_successes[:n_episodes],
                     all_seeds[:n_episodes],
+                    all_episode_metadata[:n_episodes],
                     strict=True,
                 )
             )
@@ -688,6 +727,7 @@ def eval_main(cfg: EvalPipelineConfig):
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=cfg.policy,
         pretrained_path=cfg.policy.pretrained_path,
+        pretrained_revision=cfg.policy.pretrained_revision,
         preprocessor_overrides=preprocessor_overrides,
     )
 
@@ -744,6 +784,7 @@ class TaskMetrics(TypedDict):
     max_rewards: list[float]
     successes: list[bool]
     video_paths: list[str]
+    episode_metadata: list[dict[str, Any] | None]
 
 
 ACC_KEYS = ("sum_rewards", "max_rewards", "successes", "video_paths")
@@ -795,6 +836,7 @@ def eval_one(
         max_rewards=[ep["max_reward"] for ep in per_episode],
         successes=[ep["success"] for ep in per_episode],
         video_paths=task_result.get("video_paths", []),
+        episode_metadata=[ep["episode_metadata"] for ep in per_episode],
     )
 
 

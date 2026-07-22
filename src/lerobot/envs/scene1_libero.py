@@ -24,6 +24,15 @@ from robosuite.models.objects import MujocoXMLObject
 from lerobot.types import RobotObservation
 
 from .libero import ACTION_DIM, ACTION_HIGH, ACTION_LOW, get_libero_dummy_action
+from .scene1_randomization import (
+    Scene1RandomizationBaseline,
+    Scene1RandomizationConfig,
+    Scene1RandomizationSample,
+    apply_scene1_randomization,
+    capture_scene1_randomization_baseline,
+    capture_scene1_realized_metadata,
+    sample_scene1_randomization,
+)
 from .utils import parse_camera_names
 
 DEFAULT_ASSETS_ROOT = Path(__file__).resolve().parents[3] / "data" / "mujoco_scene1_libero" / "assets"
@@ -322,6 +331,8 @@ class Scene1LiberoEnv(gym.Env):
         control_mode: str = "relative",
         task_id: int = 0,
         layout: str = "original",
+        target_object: str = "scene1_fying_glass_1",
+        domain_randomization: Scene1RandomizationConfig | Mapping[str, Any] | None = None,
     ):
         super().__init__()
         os.environ["LEROBOT_SCENE1_LIBERO_ASSETS"] = str(Path(assets_root).expanduser().resolve())
@@ -338,7 +349,17 @@ class Scene1LiberoEnv(gym.Env):
         self._max_episode_steps = episode_length
         self.control_mode = control_mode
         self.layout = layout
+        self.target_object = target_object
+        if domain_randomization is None:
+            domain_randomization = Scene1RandomizationConfig()
+        elif isinstance(domain_randomization, Mapping):
+            domain_randomization = Scene1RandomizationConfig(**domain_randomization)
+        self.domain_randomization = domain_randomization
+        self._randomization_sample: Scene1RandomizationSample | None = None
+        self._randomization_baseline: Scene1RandomizationBaseline | None = None
+        self._episode_metadata: dict[str, Any] = {"domain_randomization": None}
         self._env: OffScreenRenderEnv | None = None
+        self._last_raw_obs: RobotObservation | None = None
 
         if camera_name_mapping is None:
             camera_name_mapping = {
@@ -494,12 +515,62 @@ class Scene1LiberoEnv(gym.Env):
         self._env.seed(seed)
         raw_obs = self._env.reset()
         self._apply_initial_scene_layout()
+        if self.domain_randomization.enabled:
+            episode_seed = (
+                int(seed)
+                if seed is not None
+                else int(self.np_random.integers(0, np.iinfo(np.uint32).max, dtype=np.uint32))
+            )
+            joint_id = self._env.sim.model.joint_name2id(f"{self.target_object}_joint0")
+            qpos_address = int(self._env.sim.model.jnt_qposadr[joint_id])
+            target_xy = (
+                float(self._env.sim.data.qpos[qpos_address]),
+                float(self._env.sim.data.qpos[qpos_address + 1]),
+            )
+            object_xy = dict(SCENE1_ORIGINAL_XY)
+            object_xy.update(
+                {name: (pose.x, pose.y) for name, pose in SCENE1_LAYOUTS.get(self.layout, {}).items()}
+            )
+            other_object_xy = {name: xy for name, xy in object_xy.items() if name != self.target_object}
+            self._randomization_sample = sample_scene1_randomization(
+                self.domain_randomization.profile,
+                episode_seed,
+                target_xy=target_xy,
+                other_object_xy=other_object_xy,
+                table_margin=self.domain_randomization.table_margin,
+                minimum_clearance=self.domain_randomization.minimum_object_clearance,
+                max_pose_sampling_attempts=self.domain_randomization.max_pose_sampling_attempts,
+            )
+            self._randomization_baseline = capture_scene1_randomization_baseline(
+                self._env.sim, self.target_object
+            )
+            apply_scene1_randomization(
+                self._env.sim, self._randomization_baseline, self._randomization_sample
+            )
+        else:
+            self._randomization_sample = None
+            self._randomization_baseline = None
         settle_steps = max(self.num_steps_wait, 40) if self.layout != "original" else self.num_steps_wait
         for _ in range(settle_steps):
             raw_obs, _, _, _ = self._env.step(get_libero_dummy_action())
-        if self.layout == "original":
+        pose_randomized = (
+            self._randomization_sample is not None and self._randomization_sample.object_pose is not None
+        )
+        if self.layout == "original" and not pose_randomized:
             self._apply_original_scene_layout()
+        if self._randomization_sample is not None and self._randomization_baseline is not None:
+            self._episode_metadata = {
+                "domain_randomization": capture_scene1_realized_metadata(
+                    self._env.sim,
+                    self.target_object,
+                    self._randomization_sample,
+                    self._randomization_baseline,
+                )
+            }
+        else:
+            self._episode_metadata = {"domain_randomization": None}
         raw_obs = self._env.env._get_observations()
+        self._last_raw_obs = raw_obs
         if self.control_mode == "absolute":
             for robot in self._env.robots:
                 robot.controller.use_delta = False
@@ -508,7 +579,13 @@ class Scene1LiberoEnv(gym.Env):
                 robot.controller.use_delta = True
         else:
             raise ValueError(f"Invalid control mode: {self.control_mode}")
-        return self._format_raw_obs(raw_obs), {"is_success": False}
+        return self._format_raw_obs(raw_obs), {"is_success": False, **self.get_episode_metadata()}
+
+    def get_episode_metadata(self) -> dict[str, Any]:
+        return self._episode_metadata
+
+    def get_randomization_metadata(self) -> dict[str, Any] | None:
+        return self._episode_metadata["domain_randomization"]
 
     def step(self, action: np.ndarray) -> tuple[RobotObservation, float, bool, bool, dict[str, Any]]:
         self._ensure_env()
@@ -516,18 +593,19 @@ class Scene1LiberoEnv(gym.Env):
         if action.ndim != 1:
             raise ValueError(f"Expected 1-D action, got {action.shape}")
         raw_obs, reward, done, info = self._env.step(action)
+        self._last_raw_obs = raw_obs
         is_success = self._env.check_success()
         terminated = bool(done or is_success)
         info.update({"task": self.task, "task_id": self.task_id, "done": done, "is_success": is_success})
         observation = self._format_raw_obs(raw_obs)
-        if terminated:
-            self.reset()
         return observation, float(reward), terminated, False, info
 
     def render(self):
         self._ensure_env()
         assert self._env is not None
-        raw_obs = self._env.env._get_observations()
+        raw_obs = self._last_raw_obs
+        if raw_obs is None:
+            raw_obs = self._env.env._get_observations()
         image = self._format_raw_obs(raw_obs)["pixels"]["image"]
         return image[::-1, ::-1]
 
@@ -535,6 +613,7 @@ class Scene1LiberoEnv(gym.Env):
         if self._env is not None:
             self._env.close()
             self._env = None
+        self._last_raw_obs = None
 
 
 def create_scene1_libero_envs(
@@ -561,15 +640,24 @@ def create_scene1_libero_envs(
             prompt=prompt or spec.prompt,
             task_id=task_id,
             layout=spec.layout,
+            target_object=spec.target_object,
             **kwargs,
         )
 
     for task_id, spec in enumerate(task_specs):
         fns = [partial(_make_env, spec, task_id, **gym_kwargs) for _ in range(n_envs)]
-        if env_cls is gym.vector.AsyncVectorEnv:
-            envs["scene1_libero"][task_id] = env_cls(
-                fns, context="forkserver"
-            )
+        vector_kwargs = {"context": "forkserver"} if env_cls is gym.vector.AsyncVectorEnv else {}
+        try:
+            from gymnasium.vector import AutoresetMode
+        except ImportError:
+            envs["scene1_libero"][task_id] = env_cls(fns, **vector_kwargs)
         else:
-            envs["scene1_libero"][task_id] = env_cls(fns)
+            try:
+                envs["scene1_libero"][task_id] = env_cls(
+                    fns, autoreset_mode=AutoresetMode.SAME_STEP, **vector_kwargs
+                )
+            except TypeError as exc:
+                if "autoreset_mode" not in str(exc):
+                    raise
+                envs["scene1_libero"][task_id] = env_cls(fns, **vector_kwargs)
     return envs
