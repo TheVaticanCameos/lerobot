@@ -218,9 +218,13 @@ def test_scene1_reset_applies_pose_before_settling_and_reports_realized_metadata
 
     env = object.__new__(scene1_libero.Scene1LiberoEnv)
     env._env = FakeLiberoEnv()
+    env.scene_task = "pick_magnifying_glass"
+    env.scene_variant = "full_scene"
+    env.bddl_path = "/tmp/scene1_pick_magnifying_glass.bddl"
     env.target_object = "scene1_fying_glass_1"
     env.domain_randomization = Scene1RandomizationConfig(enabled=True, profile="pose_s1")
     env.num_steps_wait = 2
+    env.variant_settle_steps = 2
     env.layout = "original"
     env.control_mode = "relative"
     env._ensure_env = lambda: None
@@ -233,7 +237,18 @@ def test_scene1_reset_applies_pose_before_settling_and_reports_realized_metadata
     assert env._env.steps == 2
     assert metadata["requested"]["object_pose"] is not None
     assert metadata["realized"]["target_object"]["qpos"][0] == pytest.approx(sim.data.qpos[0])
-    assert env.get_episode_metadata() == {"domain_randomization": metadata}
+    episode_metadata = env.get_episode_metadata()
+    assert episode_metadata["domain_randomization"] == metadata
+    assert episode_metadata["scene1"] == {
+        "task": "pick_magnifying_glass",
+        "variant": "full_scene",
+        "layout": "original",
+        "bddl_file": "scene1_pick_magnifying_glass.bddl",
+        "bddl_path": "/tmp/scene1_pick_magnifying_glass.bddl",
+        "target_object": "scene1_fying_glass_1",
+        "settle_steps": 2,
+        "effective_settle_steps": 2,
+    }
 
 
 def test_scene1_render_reuses_latest_observation() -> None:
@@ -273,6 +288,63 @@ def test_scene1_vector_env_owns_same_step_autoreset() -> None:
     vector_env = envs["scene1_libero"][0]
     assert vector_env.kwargs["autoreset_mode"].name == "SAME_STEP"
     assert len(vector_env.env_fns) == 2
+
+
+def test_scene1_factory_resolves_runtime_identity_without_starting_simulator() -> None:
+    scene1_libero = pytest.importorskip("lerobot.envs.scene1_libero")
+
+    class RecordingVectorEnv:
+        def __init__(self, env_fns, **kwargs) -> None:
+            self.env_fns = env_fns
+
+    envs = scene1_libero.create_scene1_libero_envs(
+        n_envs=1,
+        env_cls=RecordingVectorEnv,
+        scene_task="pick_magnifying_glass",
+        scene_variant="magnifying_glass_near_clutter",
+        assets_root=Path("data/mujoco_scene1_libero/assets"),
+    )
+    env = envs["scene1_libero"][0].env_fns[0]()
+    metadata = env.get_episode_metadata()
+    assert metadata["scene1"]["task"] == "pick_magnifying_glass"
+    assert metadata["scene1"]["variant"] == "near_clutter"
+    assert metadata["scene1"]["layout"] == "nearby_red_cars_magnifying_glass"
+    assert metadata["scene1"]["bddl_file"] == "scene1_pick_magnifying_glass.bddl"
+    assert metadata["scene1"]["target_object"] == "scene1_fying_glass_1"
+    assert metadata["scene1"]["settle_steps"] == 40
+    assert metadata["domain_randomization"] is None
+
+
+def test_factory_rejects_conflicting_custom_bddl_for_explicit_canonical_variant() -> None:
+    scene1_libero = pytest.importorskip("lerobot.envs.scene1_libero")
+
+    class UnusedVectorEnv:
+        def __init__(self, env_fns, **kwargs) -> None:
+            pytest.fail("factory must validate before constructing the vector environment")
+
+    with pytest.raises(ValueError, match="conflicts with canonical variant 'target_only'"):
+        scene1_libero.create_scene1_libero_envs(
+            n_envs=1,
+            env_cls=UnusedVectorEnv,
+            scene_task="pick_magnifying_glass",
+            scene_variant="target_only",
+            assets_root=Path("unused"),
+            bddl_path=Path("data/mujoco_scene1_libero/bddl/scene1_pick_magnifying_glass.bddl"),
+        )
+
+
+def test_factory_rejects_gym_kwargs_that_override_resolved_spec() -> None:
+    scene1_libero = pytest.importorskip("lerobot.envs.scene1_libero")
+
+    with pytest.raises(ValueError, match="cannot be overridden.*layout"):
+        scene1_libero.create_scene1_libero_envs(
+            n_envs=1,
+            env_cls=lambda env_fns: None,
+            scene_task="pick_magnifying_glass",
+            scene_variant="near_clutter",
+            assets_root=Path("unused"),
+            gym_kwargs={"layout": "original"},
+        )
 
 
 def test_scene1_step_does_not_reset_terminated_environment() -> None:

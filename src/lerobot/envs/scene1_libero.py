@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import math
 import os
-import re
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -33,118 +31,32 @@ from .scene1_randomization import (
     capture_scene1_realized_metadata,
     sample_scene1_randomization,
 )
+from .scene1_specs import (
+    SCENE1_LAYOUTS,
+    SCENE1_ORIGINAL_XY,
+    SCENE1_VARIANTS,
+    ResolvedScene1Spec,
+    Scene1ObjectPose,
+    read_scene1_bddl_inventory,
+    resolve_scene1_specs,
+    validate_scene1_bddl,
+)
 from .utils import parse_camera_names
 
 DEFAULT_ASSETS_ROOT = Path(__file__).resolve().parents[3] / "data" / "mujoco_scene1_libero" / "assets"
 DEFAULT_BDDL_ROOT = Path(__file__).resolve().parents[3] / "data" / "mujoco_scene1_libero" / "bddl"
 
 
-@dataclass(frozen=True)
-class Scene1TaskSpec:
-    key: str
-    prompt: str
-    bddl_file: str
-    target_object: str
-    layout: str = "original"
+def resolve_scene1_tasks(
+    scene_task: str | Sequence[str], scene_variant: str | None = None
+) -> list[ResolvedScene1Spec]:
+    """Compatibility wrapper around the canonical Scene1 task/variant registry."""
 
-
-SCENE1_TASKS: dict[str, Scene1TaskSpec] = {
-    "pick_red_car": Scene1TaskSpec(
-        key="pick_red_car",
-        prompt="pick up the red car",
-        bddl_file="scene1_pick_red_car.bddl",
-        target_object="scene1_toy_car_8_1",
-    ),
-    "pick_magnifying_glass": Scene1TaskSpec(
-        key="pick_magnifying_glass",
-        prompt="pick up the magnifying glass",
-        bddl_file="scene1_pick_magnifying_glass.bddl",
-        target_object="scene1_fying_glass_1",
-    ),
-    "pick_magnifying_glass_cluttered": Scene1TaskSpec(
-        key="pick_magnifying_glass_cluttered",
-        prompt="pick up the magnifying glass",
-        bddl_file="scene1_pick_magnifying_glass_cluttered.bddl",
-        target_object="scene1_fying_glass_1",
-        layout="cluttered_red_cars_magnifying_glass",
-    ),
-    "pick_gray_box": Scene1TaskSpec(
-        key="pick_gray_box",
-        prompt="pick up the gray box",
-        bddl_file="scene1_pick_gray_box.bddl",
-        target_object="scene1_toolbox_1",
-    ),
-}
-
-SCENE1_ORIGINAL_XY: dict[str, tuple[float, float]] = {
-    "scene1_blue_car_1": (0.34996563199999997, -0.02677555945),
-    "scene1_toy_car_8_1": (0.011990453899999996, 0.11388444525),
-    "scene1_toy_car_2_1": (-0.13097472655, -0.14315710595),
-    "scene1_toolbox_1": (-0.399399996, 0.09579999815),
-    "scene1_fying_glass_1": (0.14760476515, -0.10315680495),
-    "scene1_screwdriver_1": (-0.377967, -0.1730795205),
-    "scene1_bottle_4_1": (0.38229599599999997, 0.18590948699999998),
-    "scene1_bottle_5_1": (0.266199991, 0.164800003),
-    "scene1_bottle_6_1": (0.29869999, 0.21510000499999998),
-}
-
-
-@dataclass(frozen=True)
-class Scene1ObjectPose:
-    x: float
-    y: float
-    z_offset: float = 0.0
-    roll: float = 0.0
-    pitch: float = 0.0
-    yaw: float = 0.0
-
-
-SCENE1_CLUTTERED_RED_CARS_MAGNIFYING_GLASS: dict[str, Scene1ObjectPose] = {
-    "scene1_fying_glass_1": Scene1ObjectPose(x=0.125, y=-0.085, yaw=math.radians(18.0)),
-    "scene1_toy_car_8_1": Scene1ObjectPose(
-        x=0.105,
-        y=-0.085,
-        z_offset=0.035,
-        yaw=math.radians(28.0),
-    ),
-    "scene1_toy_car_2_1": Scene1ObjectPose(
-        x=0.115,
-        y=-0.085,
-        z_offset=0.115,
-        yaw=math.radians(-32.0),
-    ),
-}
-
-SCENE1_LAYOUTS: dict[str, dict[str, Scene1ObjectPose]] = {
-    "cluttered_red_cars_magnifying_glass": SCENE1_CLUTTERED_RED_CARS_MAGNIFYING_GLASS,
-}
-
-
-def resolve_scene1_tasks(scene_task: str | Sequence[str]) -> list[Scene1TaskSpec]:
-    if isinstance(scene_task, str):
-        task_keys = [key.strip() for key in scene_task.split(",") if key.strip()]
-    else:
-        task_keys = list(scene_task)
-    if not task_keys:
-        raise ValueError("At least one scene1 task must be specified.")
-
-    specs = []
-    for key in task_keys:
-        try:
-            specs.append(SCENE1_TASKS[key])
-        except KeyError as exc:
-            available = ", ".join(sorted(SCENE1_TASKS))
-            raise ValueError(f"Unknown scene1 task '{key}'. Available tasks: {available}") from exc
-    return specs
+    return resolve_scene1_specs(scene_task, scene_variant)
 
 
 def _parse_bddl_obj_of_interest(bddl_file_name: str | Path) -> str | None:
-    try:
-        text = Path(bddl_file_name).expanduser().read_text()
-    except OSError:
-        return None
-    match = re.search(r"\(:obj_of_interest\s+([^\s()]+)", text)
-    return match.group(1) if match else None
+    return read_scene1_bddl_inventory(bddl_file_name).target_object
 
 
 def _assets_root() -> Path:
@@ -330,8 +242,12 @@ class Scene1LiberoEnv(gym.Env):
         num_steps_wait: int = 10,
         control_mode: str = "relative",
         task_id: int = 0,
+        scene_task: str = "pick_magnifying_glass",
+        scene_variant: str = "full_scene",
         layout: str = "original",
         target_object: str = "scene1_fying_glass_1",
+        variant_settle_steps: int = 10,
+        unsupported_randomization_profiles: Sequence[str] = (),
         domain_randomization: Scene1RandomizationConfig | Mapping[str, Any] | None = None,
     ):
         super().__init__()
@@ -348,16 +264,44 @@ class Scene1LiberoEnv(gym.Env):
         self.num_steps_wait = num_steps_wait
         self._max_episode_steps = episode_length
         self.control_mode = control_mode
+        self.scene_task = scene_task
+        self.scene_variant = scene_variant
         self.layout = layout
         self.target_object = target_object
+        self.variant_settle_steps = variant_settle_steps
         if domain_randomization is None:
             domain_randomization = Scene1RandomizationConfig()
         elif isinstance(domain_randomization, Mapping):
             domain_randomization = Scene1RandomizationConfig(**domain_randomization)
         self.domain_randomization = domain_randomization
+        if self.domain_randomization.profile in unsupported_randomization_profiles:
+            raise ValueError(
+                f"Randomization profile '{self.domain_randomization.profile}' is not compatible "
+                f"with Scene1 variant '{scene_variant}'."
+            )
+        bddl_inventory = read_scene1_bddl_inventory(self.bddl_path)
+        if bddl_inventory.target_object != self.target_object:
+            raise ValueError(
+                f"Scene1 BDDL target {bddl_inventory.target_object!r} does not match task target "
+                f"{self.target_object!r}."
+            )
+        try:
+            layout_spec = SCENE1_LAYOUTS[self.layout]
+        except KeyError as error:
+            available = ", ".join(sorted(SCENE1_LAYOUTS))
+            raise ValueError(
+                f"Unknown Scene1 layout '{self.layout}'. Available layouts: {available}"
+            ) from error
+        missing_layout_objects = layout_spec.required_objects - bddl_inventory.object_names
+        if missing_layout_objects:
+            missing = ", ".join(sorted(missing_layout_objects))
+            raise ValueError(
+                f"Scene1 layout '{self.layout}' requires objects absent from BDDL "
+                f"'{self.bddl_path}': {missing}"
+            )
         self._randomization_sample: Scene1RandomizationSample | None = None
         self._randomization_baseline: Scene1RandomizationBaseline | None = None
-        self._episode_metadata: dict[str, Any] = {"domain_randomization": None}
+        self._episode_metadata: dict[str, Any] = self._make_episode_metadata(None)
         self._env: OffScreenRenderEnv | None = None
         self._last_raw_obs: RobotObservation | None = None
 
@@ -458,7 +402,7 @@ class Scene1LiberoEnv(gym.Env):
         self._apply_original_scene_layout()
         sim = self._env.sim
         try:
-            layout = SCENE1_LAYOUTS[self.layout]
+            layout = SCENE1_LAYOUTS[self.layout].object_poses
         except KeyError as exc:
             raise ValueError(f"Unknown Scene1 layout: {self.layout}") from exc
 
@@ -527,10 +471,17 @@ class Scene1LiberoEnv(gym.Env):
                 float(self._env.sim.data.qpos[qpos_address]),
                 float(self._env.sim.data.qpos[qpos_address + 1]),
             )
-            object_xy = dict(SCENE1_ORIGINAL_XY)
-            object_xy.update(
-                {name: (pose.x, pose.y) for name, pose in SCENE1_LAYOUTS.get(self.layout, {}).items()}
+            object_xy = {}
+            configured_xy = dict(SCENE1_ORIGINAL_XY)
+            configured_xy.update(
+                {name: (pose.x, pose.y) for name, pose in SCENE1_LAYOUTS[self.layout].object_poses.items()}
             )
+            for name, xy in configured_xy.items():
+                try:
+                    self._env.sim.model.joint_name2id(f"{name}_joint0")
+                except Exception:
+                    continue
+                object_xy[name] = xy
             other_object_xy = {name: xy for name, xy in object_xy.items() if name != self.target_object}
             self._randomization_sample = sample_scene1_randomization(
                 self.domain_randomization.profile,
@@ -550,7 +501,10 @@ class Scene1LiberoEnv(gym.Env):
         else:
             self._randomization_sample = None
             self._randomization_baseline = None
-        settle_steps = max(self.num_steps_wait, 40) if self.layout != "original" else self.num_steps_wait
+        settle_steps = max(
+            self.num_steps_wait,
+            getattr(self, "variant_settle_steps", self.num_steps_wait),
+        )
         for _ in range(settle_steps):
             raw_obs, _, _, _ = self._env.step(get_libero_dummy_action())
         pose_randomized = (
@@ -559,16 +513,16 @@ class Scene1LiberoEnv(gym.Env):
         if self.layout == "original" and not pose_randomized:
             self._apply_original_scene_layout()
         if self._randomization_sample is not None and self._randomization_baseline is not None:
-            self._episode_metadata = {
-                "domain_randomization": capture_scene1_realized_metadata(
+            self._episode_metadata = self._make_episode_metadata(
+                capture_scene1_realized_metadata(
                     self._env.sim,
                     self.target_object,
                     self._randomization_sample,
                     self._randomization_baseline,
                 )
-            }
+            )
         else:
-            self._episode_metadata = {"domain_randomization": None}
+            self._episode_metadata = self._make_episode_metadata(None)
         raw_obs = self._env.env._get_observations()
         self._last_raw_obs = raw_obs
         if self.control_mode == "absolute":
@@ -583,6 +537,21 @@ class Scene1LiberoEnv(gym.Env):
 
     def get_episode_metadata(self) -> dict[str, Any]:
         return self._episode_metadata
+
+    def _make_episode_metadata(self, randomization: dict[str, Any] | None) -> dict[str, Any]:
+        return {
+            "scene1": {
+                "task": self.scene_task,
+                "variant": self.scene_variant,
+                "layout": self.layout,
+                "bddl_file": Path(self.bddl_path).name,
+                "bddl_path": self.bddl_path,
+                "target_object": self.target_object,
+                "settle_steps": self.variant_settle_steps,
+                "effective_settle_steps": max(self.num_steps_wait, self.variant_settle_steps),
+            },
+            "domain_randomization": randomization,
+        }
 
     def get_randomization_metadata(self) -> dict[str, Any] | None:
         return self._episode_metadata["domain_randomization"]
@@ -621,26 +590,57 @@ def create_scene1_libero_envs(
     n_envs: int,
     env_cls: Callable[[Sequence[Callable[[], Any]]], Any],
     scene_task: str | Sequence[str],
+    scene_variant: str | None = None,
     assets_root: str | Path,
     bddl_path: str | Path | None = None,
     prompt: str | None = None,
     gym_kwargs: Mapping[str, Any] | None = None,
 ) -> dict[str, dict[int, Any]]:
     gym_kwargs = dict(gym_kwargs or {})
-    task_specs = resolve_scene1_tasks(scene_task)
+    resolved_fields = {
+        "bddl_path",
+        "layout",
+        "scene_task",
+        "scene_variant",
+        "target_object",
+        "task_id",
+        "variant_settle_steps",
+        "unsupported_randomization_profiles",
+    }
+    conflicting_fields = resolved_fields & gym_kwargs.keys()
+    if conflicting_fields:
+        fields = ", ".join(sorted(conflicting_fields))
+        raise ValueError(f"Scene1 resolved spec fields cannot be overridden through gym_kwargs: {fields}")
+    task_specs = resolve_scene1_tasks(scene_task, scene_variant)
     if len(task_specs) > 1 and (bddl_path is not None or prompt is not None):
         raise ValueError("Custom bddl_path/prompt overrides are only supported for a single scene1 task.")
 
     envs: dict[str, dict[int, Any]] = {"scene1_libero": {}}
 
-    def _make_env(spec: Scene1TaskSpec, task_id: int, **kwargs) -> Scene1LiberoEnv:
+    resolved_bddl_paths: dict[str, Path] = {}
+    canonical_variant_requested = scene_variant in SCENE1_VARIANTS
+    for spec in task_specs:
+        selected_bddl_path = bddl_path if bddl_path is not None else DEFAULT_BDDL_ROOT / spec.bddl_file
+        resolved_bddl_path = Path(selected_bddl_path).expanduser().resolve()
+        validate_scene1_bddl(
+            spec,
+            resolved_bddl_path,
+            require_canonical_inventory=bddl_path is None or canonical_variant_requested,
+        )
+        resolved_bddl_paths[spec.key] = resolved_bddl_path
+
+    def _make_env(spec: ResolvedScene1Spec, task_id: int, **kwargs) -> Scene1LiberoEnv:
         return Scene1LiberoEnv(
-            bddl_path=bddl_path or DEFAULT_BDDL_ROOT / spec.bddl_file,
+            bddl_path=resolved_bddl_paths[spec.key],
             assets_root=assets_root,
             prompt=prompt or spec.prompt,
             task_id=task_id,
-            layout=spec.layout,
+            scene_task=spec.task_key,
+            scene_variant=spec.variant_key,
+            layout=spec.layout.key,
             target_object=spec.target_object,
+            variant_settle_steps=spec.settle_steps,
+            unsupported_randomization_profiles=spec.unsupported_randomization_profiles,
             **kwargs,
         )
 

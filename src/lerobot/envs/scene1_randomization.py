@@ -155,9 +155,28 @@ def _profile(
     return Scene1RandomizationProfile(object_pose, lighting_ranges, camera_ranges)
 
 
+def _profile_pose_ablation(
+    *, xy_severity: int | None = None, yaw_severity: int | None = None
+) -> Scene1RandomizationProfile:
+    """Create a pose ablation profile with independent XY and yaw severity.
+
+    Setting a severity to ``None`` or ``0`` disables that factor.  When only
+    one factor is active the other is set to zero range, which still consumes
+    the same RNG draws so that per-seed samples remain aligned with the
+    combined ``pose_s*`` profiles.
+    """
+    xy = _POSE_XY[xy_severity - 1] if xy_severity else 0.0
+    yaw = math.radians(_POSE_YAW_DEGREES[yaw_severity - 1]) if yaw_severity else 0.0
+    if xy == 0.0 and yaw == 0.0:
+        return Scene1RandomizationProfile()
+    return Scene1RandomizationProfile(ObjectPoseRanges(xy, yaw))
+
+
 SCENE1_RANDOMIZATION_PROFILES: Mapping[str, Scene1RandomizationProfile] = {
     "nominal": Scene1RandomizationProfile(),
     **{f"pose_s{severity}": _profile(pose=severity) for severity in range(1, 4)},
+    **{f"pose_xy_s{severity}": _profile_pose_ablation(xy_severity=severity) for severity in range(1, 4)},
+    **{f"pose_yaw_s{severity}": _profile_pose_ablation(yaw_severity=severity) for severity in range(1, 4)},
     **{f"lighting_s{severity}": _profile(lighting=severity) for severity in range(1, 4)},
     **{f"camera_s{severity}": _profile(camera=severity) for severity in range(1, 4)},
     **{

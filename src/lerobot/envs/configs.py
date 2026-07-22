@@ -450,6 +450,7 @@ class LiberoEnv(EnvConfig):
 class Scene1LiberoEnv(EnvConfig):
     task: str = "scene1_libero"
     scene_task: str = "pick_magnifying_glass"
+    scene_variant: str | None = None
     bddl_path: str | None = None
     assets_root: str = "data/mujoco_scene1_libero/assets"
     prompt: str | None = None
@@ -513,6 +514,7 @@ class Scene1LiberoEnv(EnvConfig):
             n_envs=n_envs,
             env_cls=_make_vec_env_cls(use_async_envs, n_envs),
             scene_task=self.scene_task,
+            scene_variant=self.scene_variant,
             assets_root=self.assets_root,
             bddl_path=self.bddl_path,
             prompt=self.prompt,
