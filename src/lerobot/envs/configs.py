@@ -449,7 +449,7 @@ class LiberoEnv(EnvConfig):
 @dataclass
 class Scene1LiberoEnv(EnvConfig):
     task: str = "scene1_libero"
-    scene_task: str = "pick_magnifying_glass"
+    scene_task: str = "pick_and_place_magnifying_glass"
     scene_variant: str | None = None
     bddl_path: str | None = None
     assets_root: str = "data/mujoco_scene1_libero/assets"

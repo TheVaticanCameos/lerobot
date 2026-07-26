@@ -24,6 +24,21 @@ class Scene1LayoutSpec:
     key: str
     object_poses: Mapping[str, Scene1ObjectPose]
     required_objects: frozenset[str] = frozenset()
+    pose_randomization_group: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True)
+class Scene1SuccessSemantics:
+    kind: str
+    receptacle_object: str | None = None
+    relation: str | None = None
+    minimum_target_height: float | None = None
+    require_grasp: bool = False
+    require_release: bool = False
+    minimum_lift_height_delta: float = 0.0
+    max_linear_speed: float = math.inf
+    max_angular_speed: float = math.inf
+    stable_steps: int = 1
 
 
 @dataclass(frozen=True)
@@ -31,6 +46,7 @@ class Scene1TaskSpec:
     key: str
     prompt: str
     target_object: str
+    semantics: Scene1SuccessSemantics
 
 
 @dataclass(frozen=True)
@@ -51,6 +67,7 @@ class ResolvedScene1Spec:
     variant_key: str
     prompt: str
     target_object: str
+    semantics: Scene1SuccessSemantics
     bddl_file: str
     object_names: frozenset[str]
     layout: Scene1LayoutSpec
@@ -60,8 +77,10 @@ class ResolvedScene1Spec:
 
 @dataclass(frozen=True)
 class Scene1BddlInventory:
+    language: str
     target_object: str
     object_names: frozenset[str]
+    goal_relations: frozenset[tuple[str, str, str]]
 
 
 SCENE1_TASK_FAMILIES: dict[str, Scene1TaskSpec] = {
@@ -69,16 +88,29 @@ SCENE1_TASK_FAMILIES: dict[str, Scene1TaskSpec] = {
         key="pick_red_car",
         prompt="pick up the red car",
         target_object="scene1_toy_car_8_1",
+        semantics=Scene1SuccessSemantics(kind="lift", minimum_target_height=1.0),
     ),
-    "pick_magnifying_glass": Scene1TaskSpec(
-        key="pick_magnifying_glass",
-        prompt="pick up the magnifying glass",
+    "pick_and_place_magnifying_glass": Scene1TaskSpec(
+        key="pick_and_place_magnifying_glass",
+        prompt="pick up the magnifying glass and place it into the box",
         target_object="scene1_fying_glass_1",
+        semantics=Scene1SuccessSemantics(
+            kind="pick_and_place",
+            receptacle_object="scene1_toolbox_1",
+            relation="In",
+            require_grasp=True,
+            require_release=True,
+            minimum_lift_height_delta=0.03,
+            max_linear_speed=0.05,
+            max_angular_speed=0.5,
+            stable_steps=3,
+        ),
     ),
     "pick_gray_box": Scene1TaskSpec(
         key="pick_gray_box",
         prompt="pick up the gray box",
         target_object="scene1_toolbox_1",
+        semantics=Scene1SuccessSemantics(kind="lift", minimum_target_height=1.0),
     ),
 }
 
@@ -127,9 +159,18 @@ _STACKED_CLUTTER_POSES = {
         yaw=math.radians(-32.0),
     ),
 }
+_TASK_OBJECTS_NEAR_POSES = {
+    "scene1_fying_glass_1": _ORIGINAL_POSES["scene1_fying_glass_1"],
+    "scene1_toolbox_1": Scene1ObjectPose(x=-0.15, y=-0.10),
+}
 
 SCENE1_LAYOUTS: dict[str, Scene1LayoutSpec] = {
     "original": Scene1LayoutSpec(key="original", object_poses=_ORIGINAL_POSES),
+    "task_objects_near": Scene1LayoutSpec(
+        key="task_objects_near",
+        object_poses=_TASK_OBJECTS_NEAR_POSES,
+        required_objects=frozenset(_TASK_OBJECTS_NEAR_POSES),
+    ),
     "nearby_red_cars_magnifying_glass": Scene1LayoutSpec(
         key="nearby_red_cars_magnifying_glass",
         object_poses=_NEAR_CLUTTER_POSES,
@@ -139,15 +180,16 @@ SCENE1_LAYOUTS: dict[str, Scene1LayoutSpec] = {
         key="cluttered_red_cars_magnifying_glass",
         object_poses=_STACKED_CLUTTER_POSES,
         required_objects=frozenset(_STACKED_CLUTTER_POSES),
+        pose_randomization_group=frozenset(_STACKED_CLUTTER_POSES),
     ),
 }
 
 _FULL_SCENE_OBJECTS = frozenset(SCENE1_ORIGINAL_XY)
-_SPARSE_DISTRACTOR_OBJECTS = frozenset({"scene1_toy_car_8_1", "scene1_toy_car_2_1", "scene1_fying_glass_1"})
-_STACKED_POSE_INCOMPATIBLE = frozenset({"pose_s1", "pose_s2", "combined_s1", "combined_s2"})
-
-# Magnifying-glass variants deliberately use short keys. The other two task
-# families retain their established keys because they do not have staged variants.
+_TASK_OBJECTS = frozenset({"scene1_fying_glass_1", "scene1_toolbox_1"})
+_SPARSE_DISTRACTOR_OBJECTS = _TASK_OBJECTS | {
+    "scene1_toy_car_8_1",
+    "scene1_toy_car_2_1",
+}
 SCENE1_VARIANTS: dict[str, Scene1VariantSpec] = {
     "red_car_full": Scene1VariantSpec(
         key="red_car_full",
@@ -155,40 +197,46 @@ SCENE1_VARIANTS: dict[str, Scene1VariantSpec] = {
         bddl_file="scene1_pick_red_car.bddl",
         object_names=_FULL_SCENE_OBJECTS,
     ),
-    "target_only": Scene1VariantSpec(
-        key="target_only",
-        task_key="pick_magnifying_glass",
-        bddl_file="scene1_pick_magnifying_glass_target_only.bddl",
-        object_names=frozenset({"scene1_fying_glass_1"}),
+    "task_objects_near": Scene1VariantSpec(
+        key="task_objects_near",
+        task_key="pick_and_place_magnifying_glass",
+        bddl_file="scene1_pick_and_place_magnifying_glass_task_objects.bddl",
+        object_names=_TASK_OBJECTS,
+        layout_key="task_objects_near",
+    ),
+    "task_objects": Scene1VariantSpec(
+        key="task_objects",
+        task_key="pick_and_place_magnifying_glass",
+        bddl_file="scene1_pick_and_place_magnifying_glass_task_objects.bddl",
+        object_names=_TASK_OBJECTS,
     ),
     "sparse_distractors": Scene1VariantSpec(
         key="sparse_distractors",
-        task_key="pick_magnifying_glass",
-        bddl_file="scene1_pick_magnifying_glass_sparse.bddl",
+        task_key="pick_and_place_magnifying_glass",
+        bddl_file="scene1_pick_and_place_magnifying_glass_sparse.bddl",
         object_names=_SPARSE_DISTRACTOR_OBJECTS,
     ),
     "full_scene": Scene1VariantSpec(
         key="full_scene",
-        task_key="pick_magnifying_glass",
-        bddl_file="scene1_pick_magnifying_glass.bddl",
+        task_key="pick_and_place_magnifying_glass",
+        bddl_file="scene1_pick_and_place_magnifying_glass.bddl",
         object_names=_FULL_SCENE_OBJECTS,
     ),
     "near_clutter": Scene1VariantSpec(
         key="near_clutter",
-        task_key="pick_magnifying_glass",
-        bddl_file="scene1_pick_magnifying_glass.bddl",
+        task_key="pick_and_place_magnifying_glass",
+        bddl_file="scene1_pick_and_place_magnifying_glass.bddl",
         object_names=_FULL_SCENE_OBJECTS,
         layout_key="nearby_red_cars_magnifying_glass",
         settle_steps=40,
     ),
     "stacked_clutter": Scene1VariantSpec(
         key="stacked_clutter",
-        task_key="pick_magnifying_glass",
-        bddl_file="scene1_pick_magnifying_glass.bddl",
+        task_key="pick_and_place_magnifying_glass",
+        bddl_file="scene1_pick_and_place_magnifying_glass.bddl",
         object_names=_FULL_SCENE_OBJECTS,
         layout_key="cluttered_red_cars_magnifying_glass",
         settle_steps=40,
-        unsupported_randomization_profiles=_STACKED_POSE_INCOMPATIBLE,
     ),
     "gray_box_full": Scene1VariantSpec(
         key="gray_box_full",
@@ -198,19 +246,10 @@ SCENE1_VARIANTS: dict[str, Scene1VariantSpec] = {
     ),
 }
 
-SCENE1_VARIANT_ALIASES: dict[str, str] = {
-    "magnifying_glass_target_only": "target_only",
-    "magnifying_glass_sparse": "sparse_distractors",
-    "magnifying_glass_full": "full_scene",
-    "magnifying_glass_near_clutter": "near_clutter",
-    "magnifying_glass_stacked_clutter": "stacked_clutter",
-}
-
-SCENE1_TASK_ALIASES: dict[str, tuple[str, str]] = {
-    "pick_red_car": ("pick_red_car", "red_car_full"),
-    "pick_magnifying_glass": ("pick_magnifying_glass", "full_scene"),
-    "pick_magnifying_glass_cluttered": ("pick_magnifying_glass", "stacked_clutter"),
-    "pick_gray_box": ("pick_gray_box", "gray_box_full"),
+SCENE1_TASK_DEFAULT_VARIANTS: dict[str, str] = {
+    "pick_red_car": "red_car_full",
+    "pick_and_place_magnifying_glass": "full_scene",
+    "pick_gray_box": "gray_box_full",
 }
 
 
@@ -222,6 +261,11 @@ def read_scene1_bddl_inventory(bddl_path: str | Path) -> Scene1BddlInventory:
         text = path.read_text(encoding="utf-8")
     except OSError as error:
         raise OSError(f"Unable to read Scene1 BDDL file '{path}': {error}") from error
+
+    language_match = re.search(r"\(:language\s+([^()\n]+?)\s*\)", text)
+    if language_match is None:
+        raise ValueError(f"Scene1 BDDL '{path}' is missing a parseable :language field.")
+    language = language_match.group(1).strip()
 
     objects_match = re.search(r"\(:objects\s+(.*?)\)\s*\(:obj_of_interest", text, re.DOTALL)
     if objects_match is None:
@@ -240,7 +284,21 @@ def read_scene1_bddl_inventory(bddl_path: str | Path) -> Scene1BddlInventory:
         raise ValueError(
             f"Scene1 BDDL '{path}' target '{target_object}' is not declared in its :objects section."
         )
-    return Scene1BddlInventory(target_object=target_object, object_names=object_names)
+    goal_start = text.find("(:goal")
+    if goal_start < 0:
+        raise ValueError(f"Scene1 BDDL '{path}' is missing a :goal section.")
+    goal_relations = frozenset(
+        (relation, subject, object_name)
+        for relation, subject, object_name in re.findall(
+            r"\((In|On)\s+([^\s()]+)\s+([^\s()]+)\)", text[goal_start:]
+        )
+    )
+    return Scene1BddlInventory(
+        language=language,
+        target_object=target_object,
+        object_names=object_names,
+        goal_relations=goal_relations,
+    )
 
 
 def validate_scene1_bddl(
@@ -250,11 +308,26 @@ def validate_scene1_bddl(
     require_canonical_inventory: bool,
 ) -> Scene1BddlInventory:
     inventory = read_scene1_bddl_inventory(bddl_path)
+    if inventory.language != spec.prompt:
+        raise ValueError(
+            f"Scene1 BDDL '{bddl_path}' language {inventory.language!r} does not match task "
+            f"prompt {spec.prompt!r}."
+        )
     if inventory.target_object != spec.target_object:
         raise ValueError(
             f"Scene1 BDDL '{bddl_path}' targets '{inventory.target_object}', but task "
             f"'{spec.task_key}' targets '{spec.target_object}'."
         )
+    receptacle = spec.semantics.receptacle_object
+    if receptacle is not None:
+        if receptacle not in inventory.object_names:
+            raise ValueError(f"Scene1 BDDL '{bddl_path}' is missing task receptacle '{receptacle}'.")
+        expected_relation = (spec.semantics.relation or "In", spec.target_object, receptacle)
+        if expected_relation not in inventory.goal_relations:
+            relation, target, receptacle = expected_relation
+            raise ValueError(
+                f"Scene1 BDDL '{bddl_path}' goal must contain ({relation} {target} {receptacle})."
+            )
     missing_layout_objects = spec.layout.required_objects - inventory.object_names
     if missing_layout_objects:
         missing = ", ".join(sorted(missing_layout_objects))
@@ -288,20 +361,20 @@ def resolve_scene1_specs(
     resolved = []
     for requested_key in task_keys:
         try:
-            task_key, default_variant = SCENE1_TASK_ALIASES[requested_key]
+            task = SCENE1_TASK_FAMILIES[requested_key]
+            default_variant = SCENE1_TASK_DEFAULT_VARIANTS[requested_key]
         except KeyError as error:
-            available = ", ".join(sorted(SCENE1_TASK_ALIASES))
+            available = ", ".join(sorted(SCENE1_TASK_FAMILIES))
             raise ValueError(
                 f"Unknown scene1 task '{requested_key}'. Available tasks: {available}"
             ) from error
         requested_variant = scene_variant or default_variant
-        variant_key = SCENE1_VARIANT_ALIASES.get(requested_variant, requested_variant)
+        variant_key = requested_variant
         try:
-            task = SCENE1_TASK_FAMILIES[task_key]
             variant = SCENE1_VARIANTS[variant_key]
             layout = SCENE1_LAYOUTS[variant.layout_key]
         except KeyError as error:
-            available = ", ".join(sorted(SCENE1_VARIANTS | SCENE1_VARIANT_ALIASES))
+            available = ", ".join(sorted(SCENE1_VARIANTS))
             raise ValueError(
                 f"Unknown Scene1 variant '{requested_variant}'. Available variants: {available}"
             ) from error
@@ -324,6 +397,7 @@ def resolve_scene1_specs(
                 variant_key=variant.key,
                 prompt=task.prompt,
                 target_object=task.target_object,
+                semantics=task.semantics,
                 bddl_file=variant.bddl_file,
                 object_names=variant.object_names,
                 layout=layout,

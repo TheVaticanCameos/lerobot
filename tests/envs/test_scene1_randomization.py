@@ -20,11 +20,13 @@ from lerobot.envs.scene1_randomization import (
     is_valid_object_candidate,
     sample_scene1_randomization,
 )
+from lerobot.envs.scene1_specs import Scene1SuccessSemantics
 
 
 class FakeModel:
     def __init__(self) -> None:
         self.jnt_qposadr = np.array([0])
+        self.jnt_dofadr = np.array([0])
         self.light_pos = np.array([[1.0, 2.0, 3.0], [-1.0, 1.0, 2.0]])
         self.light_diffuse = np.array([[0.8, 0.7, 0.6], [0.4, 0.5, 0.6]])
         self.light_specular = np.array([[0.3, 0.3, 0.3], [0.2, 0.2, 0.2]])
@@ -47,6 +49,7 @@ class FakeModel:
 class FakeData:
     def __init__(self) -> None:
         self.qpos = np.array([0.1, -0.2, 0.9, 1.0, 0.0, 0.0, 0.0])
+        self.qvel = np.zeros(6)
 
 
 class FakeSim:
@@ -218,10 +221,22 @@ def test_scene1_reset_applies_pose_before_settling_and_reports_realized_metadata
 
     env = object.__new__(scene1_libero.Scene1LiberoEnv)
     env._env = FakeLiberoEnv()
-    env.scene_task = "pick_magnifying_glass"
+    env.scene_task = "pick_and_place_magnifying_glass"
     env.scene_variant = "full_scene"
-    env.bddl_path = "/tmp/scene1_pick_magnifying_glass.bddl"
+    env.bddl_path = "/tmp/scene1_pick_and_place_magnifying_glass.bddl"
     env.target_object = "scene1_fying_glass_1"
+    env.receptacle_object = "scene1_toolbox_1"
+    env.success_semantics = Scene1SuccessSemantics(
+        kind="pick_and_place",
+        receptacle_object="scene1_toolbox_1",
+        relation="In",
+        require_grasp=True,
+        require_release=True,
+        minimum_lift_height_delta=0.03,
+        max_linear_speed=0.05,
+        max_angular_speed=0.5,
+        stable_steps=3,
+    )
     env.domain_randomization = Scene1RandomizationConfig(enabled=True, profile="pose_s1")
     env.num_steps_wait = 2
     env.variant_settle_steps = 2
@@ -231,6 +246,7 @@ def test_scene1_reset_applies_pose_before_settling_and_reports_realized_metadata
     env._apply_initial_scene_layout = lambda: None
     env._apply_original_scene_layout = lambda: pytest.fail("randomized pose must not be restored")
     env._format_raw_obs = lambda observation: observation
+    env._task_progress = lambda observation, update_stability: {"success": False}
 
     _, info = scene1_libero.Scene1LiberoEnv.reset(env, seed=11)
     metadata = info["domain_randomization"]
@@ -240,12 +256,23 @@ def test_scene1_reset_applies_pose_before_settling_and_reports_realized_metadata
     episode_metadata = env.get_episode_metadata()
     assert episode_metadata["domain_randomization"] == metadata
     assert episode_metadata["scene1"] == {
-        "task": "pick_magnifying_glass",
+        "task": "pick_and_place_magnifying_glass",
         "variant": "full_scene",
         "layout": "original",
-        "bddl_file": "scene1_pick_magnifying_glass.bddl",
-        "bddl_path": "/tmp/scene1_pick_magnifying_glass.bddl",
+        "bddl_file": "scene1_pick_and_place_magnifying_glass.bddl",
+        "bddl_path": "/tmp/scene1_pick_and_place_magnifying_glass.bddl",
         "target_object": "scene1_fying_glass_1",
+        "receptacle_object": "scene1_toolbox_1",
+        "success_semantics": {
+            "kind": "pick_and_place",
+            "relation": "In",
+            "require_grasp": True,
+            "require_release": True,
+            "minimum_lift_height_delta": 0.03,
+            "max_linear_speed": 0.05,
+            "max_angular_speed": 0.5,
+            "stable_steps": 3,
+        },
         "settle_steps": 2,
         "effective_settle_steps": 2,
     }
@@ -282,7 +309,7 @@ def test_scene1_vector_env_owns_same_step_autoreset() -> None:
     envs = scene1_libero.create_scene1_libero_envs(
         n_envs=2,
         env_cls=RecordingVectorEnv,
-        scene_task="pick_magnifying_glass",
+        scene_task="pick_and_place_magnifying_glass",
         assets_root=Path("unused"),
     )
     vector_env = envs["scene1_libero"][0]
@@ -300,17 +327,18 @@ def test_scene1_factory_resolves_runtime_identity_without_starting_simulator() -
     envs = scene1_libero.create_scene1_libero_envs(
         n_envs=1,
         env_cls=RecordingVectorEnv,
-        scene_task="pick_magnifying_glass",
-        scene_variant="magnifying_glass_near_clutter",
+        scene_task="pick_and_place_magnifying_glass",
+        scene_variant="near_clutter",
         assets_root=Path("data/mujoco_scene1_libero/assets"),
     )
     env = envs["scene1_libero"][0].env_fns[0]()
     metadata = env.get_episode_metadata()
-    assert metadata["scene1"]["task"] == "pick_magnifying_glass"
+    assert metadata["scene1"]["task"] == "pick_and_place_magnifying_glass"
     assert metadata["scene1"]["variant"] == "near_clutter"
     assert metadata["scene1"]["layout"] == "nearby_red_cars_magnifying_glass"
-    assert metadata["scene1"]["bddl_file"] == "scene1_pick_magnifying_glass.bddl"
+    assert metadata["scene1"]["bddl_file"] == "scene1_pick_and_place_magnifying_glass.bddl"
     assert metadata["scene1"]["target_object"] == "scene1_fying_glass_1"
+    assert metadata["scene1"]["receptacle_object"] == "scene1_toolbox_1"
     assert metadata["scene1"]["settle_steps"] == 40
     assert metadata["domain_randomization"] is None
 
@@ -322,14 +350,14 @@ def test_factory_rejects_conflicting_custom_bddl_for_explicit_canonical_variant(
         def __init__(self, env_fns, **kwargs) -> None:
             pytest.fail("factory must validate before constructing the vector environment")
 
-    with pytest.raises(ValueError, match="conflicts with canonical variant 'target_only'"):
+    with pytest.raises(ValueError, match="conflicts with canonical variant 'task_objects'"):
         scene1_libero.create_scene1_libero_envs(
             n_envs=1,
             env_cls=UnusedVectorEnv,
-            scene_task="pick_magnifying_glass",
-            scene_variant="target_only",
+            scene_task="pick_and_place_magnifying_glass",
+            scene_variant="task_objects",
             assets_root=Path("unused"),
-            bddl_path=Path("data/mujoco_scene1_libero/bddl/scene1_pick_magnifying_glass.bddl"),
+            bddl_path=Path("data/mujoco_scene1_libero/bddl/scene1_pick_and_place_magnifying_glass.bddl"),
         )
 
 
@@ -340,7 +368,7 @@ def test_factory_rejects_gym_kwargs_that_override_resolved_spec() -> None:
         scene1_libero.create_scene1_libero_envs(
             n_envs=1,
             env_cls=lambda env_fns: None,
-            scene_task="pick_magnifying_glass",
+            scene_task="pick_and_place_magnifying_glass",
             scene_variant="near_clutter",
             assets_root=Path("unused"),
             gym_kwargs={"layout": "original"},
@@ -361,12 +389,18 @@ def test_scene1_step_does_not_reset_terminated_environment() -> None:
     env._env = FakeLiberoEnv()
     env.task = "task"
     env.task_id = 0
+    env._step_count = 0
+    env._max_episode_steps = 2
     env._ensure_env = lambda: None
     env._format_raw_obs = lambda observation: observation
+    env._task_progress = lambda observation, update_stability: {"success": False}
     env.reset = lambda: pytest.fail("step() must leave autoreset to the vector environment")
 
-    _, _, terminated, _, _ = scene1_libero.Scene1LiberoEnv.step(env, np.zeros(7))
-    assert terminated
+    _, reward, terminated, truncated, info = scene1_libero.Scene1LiberoEnv.step(env, np.zeros(7))
+    assert not terminated
+    assert not truncated
+    assert reward == 0.0
+    assert info["backend_done"]
 
 
 def test_scene1_vector_env_autoreset_compatibility_fallback() -> None:
@@ -381,7 +415,7 @@ def test_scene1_vector_env_autoreset_compatibility_fallback() -> None:
     envs = scene1_libero.create_scene1_libero_envs(
         n_envs=1,
         env_cls=LegacyVectorEnv,
-        scene_task="pick_magnifying_glass",
+        scene_task="pick_and_place_magnifying_glass",
         assets_root=Path("unused"),
     )
     assert envs["scene1_libero"][0].kwargs == {}

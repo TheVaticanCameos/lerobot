@@ -8,7 +8,6 @@ from lerobot.envs.configs import Scene1LiberoEnv as Scene1LiberoConfig
 from lerobot.envs.scene1_specs import (
     SCENE1_LAYOUTS,
     SCENE1_TASK_FAMILIES,
-    SCENE1_VARIANT_ALIASES,
     SCENE1_VARIANTS,
     Scene1LayoutSpec,
     read_scene1_bddl_inventory,
@@ -22,13 +21,34 @@ BDDL_ROOT = Path(__file__).resolve().parents[2] / "data" / "mujoco_scene1_libero
 @pytest.mark.parametrize(
     ("variant", "bddl_file", "layout", "settle_steps"),
     [
-        ("target_only", "scene1_pick_magnifying_glass_target_only.bddl", "original", 10),
-        ("sparse_distractors", "scene1_pick_magnifying_glass_sparse.bddl", "original", 10),
-        ("full_scene", "scene1_pick_magnifying_glass.bddl", "original", 10),
-        ("near_clutter", "scene1_pick_magnifying_glass.bddl", "nearby_red_cars_magnifying_glass", 40),
+        (
+            "task_objects_near",
+            "scene1_pick_and_place_magnifying_glass_task_objects.bddl",
+            "task_objects_near",
+            10,
+        ),
+        (
+            "task_objects",
+            "scene1_pick_and_place_magnifying_glass_task_objects.bddl",
+            "original",
+            10,
+        ),
+        (
+            "sparse_distractors",
+            "scene1_pick_and_place_magnifying_glass_sparse.bddl",
+            "original",
+            10,
+        ),
+        ("full_scene", "scene1_pick_and_place_magnifying_glass.bddl", "original", 10),
+        (
+            "near_clutter",
+            "scene1_pick_and_place_magnifying_glass.bddl",
+            "nearby_red_cars_magnifying_glass",
+            40,
+        ),
         (
             "stacked_clutter",
-            "scene1_pick_magnifying_glass.bddl",
+            "scene1_pick_and_place_magnifying_glass.bddl",
             "cluttered_red_cars_magnifying_glass",
             40,
         ),
@@ -37,21 +57,28 @@ BDDL_ROOT = Path(__file__).resolve().parents[2] / "data" / "mujoco_scene1_libero
 def test_canonical_magnifying_glass_matrix(
     variant: str, bddl_file: str, layout: str, settle_steps: int
 ) -> None:
-    spec = resolve_scene1_specs("pick_magnifying_glass", variant)[0]
+    spec = resolve_scene1_specs("pick_and_place_magnifying_glass", variant)[0]
 
     assert spec.variant_key == variant
     assert spec.bddl_file == bddl_file
     assert spec.layout.key == layout
     assert spec.settle_steps == settle_steps
     assert spec.target_object == "scene1_fying_glass_1"
+    assert spec.prompt == "pick up the magnifying glass and place it into the box"
+    assert spec.semantics.receptacle_object == "scene1_toolbox_1"
+    assert spec.semantics.stable_steps == 3
+    assert "scene1_toolbox_1" in spec.object_names
 
 
-def test_magnifying_glass_registry_uses_only_short_canonical_keys() -> None:
-    magnifying_glass_variants = {
-        key for key, variant in SCENE1_VARIANTS.items() if variant.task_key == "pick_magnifying_glass"
+def test_magnifying_glass_registry_has_exact_canonical_keys() -> None:
+    variants = {
+        key
+        for key, variant in SCENE1_VARIANTS.items()
+        if variant.task_key == "pick_and_place_magnifying_glass"
     }
-    assert magnifying_glass_variants == {
-        "target_only",
+    assert variants == {
+        "task_objects_near",
+        "task_objects",
         "sparse_distractors",
         "full_scene",
         "near_clutter",
@@ -59,21 +86,15 @@ def test_magnifying_glass_registry_uses_only_short_canonical_keys() -> None:
     }
 
 
-@pytest.mark.parametrize(("alias", "canonical"), SCENE1_VARIANT_ALIASES.items())
-def test_prefixed_variant_aliases_resolve_to_canonical_keys(alias: str, canonical: str) -> None:
-    spec = resolve_scene1_specs("pick_magnifying_glass", alias)[0]
-    assert spec.variant_key == canonical
-
-
-def test_task_defaults_and_legacy_clutter_alias_are_preserved() -> None:
+def test_task_defaults_and_legacy_magnifying_glass_names_are_rejected() -> None:
     assert resolve_scene1_specs("pick_red_car")[0].variant_key == "red_car_full"
     assert resolve_scene1_specs("pick_gray_box")[0].variant_key == "gray_box_full"
+    assert resolve_scene1_specs("pick_and_place_magnifying_glass")[0].variant_key == "full_scene"
 
-    default = resolve_scene1_specs("pick_magnifying_glass")[0]
-    legacy_clutter = resolve_scene1_specs("pick_magnifying_glass_cluttered")[0]
-    assert default.variant_key == "full_scene"
-    assert legacy_clutter.task_key == "pick_magnifying_glass"
-    assert legacy_clutter.variant_key == "stacked_clutter"
+    with pytest.raises(ValueError, match="Unknown scene1 task"):
+        resolve_scene1_specs("pick_magnifying_glass")
+    with pytest.raises(ValueError, match="Unknown Scene1 variant"):
+        resolve_scene1_specs("pick_and_place_magnifying_glass", "magnifying_glass_full")
 
 
 def test_registry_referential_integrity() -> None:
@@ -82,8 +103,12 @@ def test_registry_referential_integrity() -> None:
         assert key == variant.key
         assert variant.task_key in SCENE1_TASK_FAMILIES
         assert variant.layout_key in SCENE1_LAYOUTS
-        assert SCENE1_TASK_FAMILIES[variant.task_key].target_object in variant.object_names
+        task = SCENE1_TASK_FAMILIES[variant.task_key]
+        assert task.target_object in variant.object_names
+        if task.semantics.receptacle_object is not None:
+            assert task.semantics.receptacle_object in variant.object_names
         assert SCENE1_LAYOUTS[variant.layout_key].required_objects <= variant.object_names
+        assert SCENE1_LAYOUTS[variant.layout_key].pose_randomization_group <= variant.object_names
 
 
 def test_all_variant_bddls_exist_and_match_declared_inventories() -> None:
@@ -96,6 +121,13 @@ def test_all_variant_bddls_exist_and_match_declared_inventories() -> None:
         )
         assert inventory.target_object == spec.target_object
         assert inventory.object_names == spec.object_names
+        assert inventory.language == spec.prompt
+        if spec.semantics.receptacle_object is not None:
+            assert (
+                spec.semantics.relation,
+                spec.target_object,
+                spec.semantics.receptacle_object,
+            ) in inventory.goal_relations
 
 
 def test_bddl_inventory_reports_missing_and_incoherent_files(tmp_path: Path) -> None:
@@ -103,19 +135,42 @@ def test_bddl_inventory_reports_missing_and_incoherent_files(tmp_path: Path) -> 
         read_scene1_bddl_inventory(tmp_path / "missing.bddl")
 
     malformed = tmp_path / "malformed.bddl"
-    malformed.write_text("(define (problem broken))", encoding="utf-8")
+    malformed.write_text("(define (problem broken) (:language broken))", encoding="utf-8")
     with pytest.raises(ValueError, match=":objects section"):
         read_scene1_bddl_inventory(malformed)
 
 
 def test_canonical_variant_rejects_conflicting_bddl_inventory() -> None:
-    spec = resolve_scene1_specs("pick_magnifying_glass", "target_only")[0]
-    with pytest.raises(ValueError, match="conflicts with canonical variant 'target_only'"):
+    spec = resolve_scene1_specs("pick_and_place_magnifying_glass", "task_objects")[0]
+    with pytest.raises(ValueError, match="conflicts with canonical variant 'task_objects'"):
         validate_scene1_bddl(
             spec,
-            BDDL_ROOT / "scene1_pick_magnifying_glass.bddl",
+            BDDL_ROOT / "scene1_pick_and_place_magnifying_glass.bddl",
             require_canonical_inventory=True,
         )
+
+
+def test_bddl_validation_rejects_wrong_prompt_and_missing_receptacle_goal(tmp_path: Path) -> None:
+    spec = resolve_scene1_specs("pick_and_place_magnifying_glass", "task_objects")[0]
+    canonical = (BDDL_ROOT / spec.bddl_file).read_text(encoding="utf-8")
+
+    wrong_prompt = tmp_path / "wrong_prompt.bddl"
+    wrong_prompt.write_text(
+        canonical.replace("place it into the box", "place it in the bin"), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="does not match task prompt"):
+        validate_scene1_bddl(spec, wrong_prompt, require_canonical_inventory=True)
+
+    wrong_goal = tmp_path / "wrong_goal.bddl"
+    wrong_goal.write_text(
+        canonical.replace(
+            "(In scene1_fying_glass_1 scene1_toolbox_1)",
+            "(On scene1_fying_glass_1 main_table_fying_glass_region)",
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="goal must contain"):
+        validate_scene1_bddl(spec, wrong_goal, require_canonical_inventory=True)
 
 
 def test_near_clutter_keeps_red_cars_clear_of_target() -> None:
@@ -127,27 +182,27 @@ def test_near_clutter_keeps_red_cars_clear_of_target() -> None:
         assert distance > 0.08
 
 
-def test_stacked_clutter_rejects_infeasible_low_pose_profiles() -> None:
+def test_stacked_clutter_randomizes_as_a_group_without_disabled_profiles() -> None:
     variant = SCENE1_VARIANTS["stacked_clutter"]
-    assert variant.unsupported_randomization_profiles == {
-        "pose_s1",
-        "pose_s2",
-        "combined_s1",
-        "combined_s2",
+    assert variant.unsupported_randomization_profiles == frozenset()
+    assert SCENE1_LAYOUTS[variant.layout_key].pose_randomization_group == {
+        "scene1_fying_glass_1",
+        "scene1_toy_car_8_1",
+        "scene1_toy_car_2_1",
     }
 
 
 def test_variant_must_belong_to_requested_task() -> None:
     with pytest.raises(ValueError, match="belongs to task"):
-        resolve_scene1_specs("pick_gray_box", "target_only")
+        resolve_scene1_specs("pick_gray_box", "task_objects")
 
 
 def test_scene1_config_exposes_variant_and_custom_bddl_to_factory() -> None:
     config = Scene1LiberoConfig(
-        scene_task="pick_magnifying_glass",
+        scene_task="pick_and_place_magnifying_glass",
         scene_variant="sparse_distractors",
         bddl_path="custom.bddl",
     )
-    assert config.scene_task == "pick_magnifying_glass"
+    assert config.scene_task == "pick_and_place_magnifying_glass"
     assert config.scene_variant == "sparse_distractors"
     assert config.bddl_path == "custom.bddl"

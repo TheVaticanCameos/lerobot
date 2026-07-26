@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import os
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import suppress
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,7 @@ from .scene1_specs import (
     SCENE1_VARIANTS,
     ResolvedScene1Spec,
     Scene1ObjectPose,
+    Scene1SuccessSemantics,
     read_scene1_bddl_inventory,
     resolve_scene1_specs,
     validate_scene1_bddl,
@@ -133,6 +135,16 @@ class Scene1Toolbox(Scene1Object):
     def __init__(self, name="scene1_toolbox", joints=None):
         super().__init__(name=name, joints=joints)
 
+    def in_box(self, position, object_position):
+        """Axis-aligned fallback for LIBERO's BDDL ``In`` predicate.
+
+        The Gym wrapper uses the rotated MuJoCo containment site and remains the
+        authoritative success checker.
+        """
+
+        local = np.asarray(object_position) - np.asarray(position) - np.array([0.03, 0.0, 0.04])
+        return bool(np.all(np.abs(local) <= np.array([0.055, 0.105, 0.04]) + 1e-6))
+
 
 @register_object
 class Scene1FyingGlass(Scene1Object):
@@ -190,34 +202,16 @@ OBJECTS_DICT.update(
 
 
 class Scene1_Tabletop_Manipulation(TASK_MAPPING["libero_tabletop_manipulation"]):  # noqa: N801
-    """LIBERO tabletop task with scene-1 movable objects.
-
-    The BDDL goal is intentionally simple; for evaluation we use a physical
-    lift condition on the magnifying glass so the task represents "pick up".
-    """
+    """LIBERO tabletop task whose completion is owned by the Gym wrapper."""
 
     def __init__(self, bddl_file_name, *args, **kwargs):
         self._scene1_target_object = _parse_bddl_obj_of_interest(bddl_file_name)
         super().__init__(bddl_file_name, *args, **kwargs)
 
     def _check_success(self):
-        height = self._object_height(self._scene1_target_object or "scene1_fying_glass_1")
-        # return height is not None and height > 0.98
-        return height is not None and height > 1.0
-
-    def _object_height(self, name_fragment: str) -> float | None:
-        try:
-            body_names = getattr(self.sim.model, "body_names", [])
-            heights = []
-            for body_name in body_names:
-                if name_fragment in body_name:
-                    body_id = self.sim.model.body_name2id(body_name)
-                    heights.append(float(self.sim.data.body_xpos[body_id][2]))
-            if heights:
-                return max(heights)
-        except Exception:
-            return None
-        return None
+        # LIBERO's BDDL predicate does not encode release, velocity, or temporal
+        # stability. Scene1LiberoEnv evaluates the complete semantic condition.
+        return False
 
 
 register_problem(Scene1_Tabletop_Manipulation)
@@ -231,7 +225,7 @@ class Scene1LiberoEnv(gym.Env):
         self,
         bddl_path: str | Path,
         assets_root: str | Path,
-        prompt: str = "pick up the magnifying glass",
+        prompt: str = "pick up the magnifying glass and place it into the box",
         episode_length: int = 280,
         camera_name: str | Sequence[str] = "agentview_image,robot0_eye_in_hand_image",
         obs_type: str = "pixels_agent_pos",
@@ -242,10 +236,12 @@ class Scene1LiberoEnv(gym.Env):
         num_steps_wait: int = 10,
         control_mode: str = "relative",
         task_id: int = 0,
-        scene_task: str = "pick_magnifying_glass",
+        scene_task: str = "pick_and_place_magnifying_glass",
         scene_variant: str = "full_scene",
         layout: str = "original",
         target_object: str = "scene1_fying_glass_1",
+        receptacle_object: str | None = "scene1_toolbox_1",
+        success_semantics: Scene1SuccessSemantics | Mapping[str, Any] | None = None,
         variant_settle_steps: int = 10,
         unsupported_randomization_profiles: Sequence[str] = (),
         domain_randomization: Scene1RandomizationConfig | Mapping[str, Any] | None = None,
@@ -268,6 +264,24 @@ class Scene1LiberoEnv(gym.Env):
         self.scene_variant = scene_variant
         self.layout = layout
         self.target_object = target_object
+        self.receptacle_object = receptacle_object
+        if success_semantics is None:
+            success_semantics = Scene1SuccessSemantics(
+                kind="pick_and_place",
+                receptacle_object=receptacle_object,
+                relation="In",
+                require_grasp=True,
+                require_release=True,
+                minimum_lift_height_delta=0.03,
+                max_linear_speed=0.05,
+                max_angular_speed=0.5,
+                stable_steps=3,
+            )
+        elif isinstance(success_semantics, Mapping):
+            success_semantics = Scene1SuccessSemantics(**success_semantics)
+        self.success_semantics = success_semantics
+        if self.success_semantics.receptacle_object != self.receptacle_object:
+            raise ValueError("Scene1 success semantics and receptacle_object must agree.")
         self.variant_settle_steps = variant_settle_steps
         if domain_randomization is None:
             domain_randomization = Scene1RandomizationConfig()
@@ -280,11 +294,27 @@ class Scene1LiberoEnv(gym.Env):
                 f"with Scene1 variant '{scene_variant}'."
             )
         bddl_inventory = read_scene1_bddl_inventory(self.bddl_path)
+        if bddl_inventory.language != self.task:
+            raise ValueError(
+                f"Scene1 BDDL language {bddl_inventory.language!r} does not match prompt {self.task!r}."
+            )
         if bddl_inventory.target_object != self.target_object:
             raise ValueError(
                 f"Scene1 BDDL target {bddl_inventory.target_object!r} does not match task target "
                 f"{self.target_object!r}."
             )
+        if self.receptacle_object is not None:
+            if self.receptacle_object not in bddl_inventory.object_names:
+                raise ValueError(f"Scene1 BDDL is missing task receptacle {self.receptacle_object!r}.")
+            expected_relation = (
+                self.success_semantics.relation or "In",
+                self.target_object,
+                self.receptacle_object,
+            )
+            if expected_relation not in bddl_inventory.goal_relations:
+                raise ValueError(
+                    "Scene1 BDDL goal does not match the configured target/receptacle semantics."
+                )
         try:
             layout_spec = SCENE1_LAYOUTS[self.layout]
         except KeyError as error:
@@ -304,6 +334,11 @@ class Scene1LiberoEnv(gym.Env):
         self._episode_metadata: dict[str, Any] = self._make_episode_metadata(None)
         self._env: OffScreenRenderEnv | None = None
         self._last_raw_obs: RobotObservation | None = None
+        self._step_count = 0
+        self._stable_success_steps = 0
+        self._ever_grasped = False
+        self._ever_lifted = False
+        self._grasp_start_height: float | None = None
 
         if camera_name_mapping is None:
             camera_name_mapping = {
@@ -421,6 +456,153 @@ class Scene1LiberoEnv(gym.Env):
         else:
             self._apply_cluttered_scene_layout()
 
+    @staticmethod
+    def _multiply_quaternions(left: np.ndarray, right: np.ndarray) -> np.ndarray:
+        lw, lx, ly, lz = left
+        rw, rx, ry, rz = right
+        return np.array(
+            [
+                lw * rw - lx * rx - ly * ry - lz * rz,
+                lw * rx + lx * rw + ly * rz - lz * ry,
+                lw * ry - lx * rz + ly * rw + lz * rx,
+                lw * rz + lx * ry - ly * rx + lz * rw,
+            ]
+        )
+
+    def _apply_grouped_pose_randomization(
+        self,
+        baseline: Scene1RandomizationBaseline,
+        sample: Scene1RandomizationSample,
+    ) -> None:
+        if sample.object_pose is None:
+            return
+        assert self._env is not None
+        group = SCENE1_LAYOUTS[self.layout].pose_randomization_group - {self.target_object}
+        if not group:
+            return
+        sim = self._env.sim
+        center = np.asarray(baseline.object_pose.position[:2])
+        delta = np.asarray(sample.object_pose.position_delta[:2])
+        angle = sample.object_pose.yaw_delta
+        rotation = np.array([[math.cos(angle), -math.sin(angle)], [math.sin(angle), math.cos(angle)]])
+        yaw_quaternion = np.array([math.cos(angle / 2.0), 0.0, 0.0, math.sin(angle / 2.0)])
+        for object_name in group:
+            joint_id = sim.model.joint_name2id(f"{object_name}_joint0")
+            address = int(sim.model.jnt_qposadr[joint_id])
+            relative_xy = np.asarray(sim.data.qpos[address : address + 2]) - center
+            sim.data.qpos[address : address + 2] = center + delta + rotation @ relative_xy
+            sim.data.qpos[address + 3 : address + 7] = self._multiply_quaternions(
+                np.asarray(sim.data.qpos[address + 3 : address + 7]), yaw_quaternion
+            )
+        sim.forward()
+
+    def _free_joint_state(self, object_name: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        assert self._env is not None
+        sim = self._env.sim
+        joint_id = sim.model.joint_name2id(f"{object_name}_joint0")
+        qpos_address = int(sim.model.jnt_qposadr[joint_id])
+        dof_address = int(sim.model.jnt_dofadr[joint_id])
+        return (
+            np.asarray(sim.data.qpos[qpos_address : qpos_address + 3], dtype=np.float64),
+            np.asarray(sim.data.qvel[dof_address : dof_address + 3], dtype=np.float64),
+            np.asarray(sim.data.qvel[dof_address + 3 : dof_address + 6], dtype=np.float64),
+        )
+
+    def _site_position(self, object_name: str, site_name: str) -> np.ndarray:
+        assert self._env is not None
+        full_name = f"{object_name}_{site_name}"
+        site_id = self._env.sim.model.site_name2id(full_name)
+        return np.asarray(self._env.sim.data.site_xpos[site_id], dtype=np.float64)
+
+    def _is_target_grasped(self) -> bool:
+        assert self._env is not None
+        try:
+            target_model = self._env.env.objects_dict[self.target_object]
+            return bool(
+                self._env.env._check_grasp(
+                    self._env.robots[0].gripper,
+                    target_model,
+                )
+            )
+        except (AttributeError, KeyError, TypeError, ValueError):
+            # Failure to observe contacts must not be interpreted as release.
+            return True
+
+    def _target_inside_receptacle(self, target_position: np.ndarray) -> tuple[bool, float | None]:
+        if self.receptacle_object is None:
+            return False, None
+        assert self._env is not None
+        sim = self._env.sim
+        site_id = sim.model.site_name2id(f"{self.receptacle_object}_containment_site")
+        site_position = np.asarray(sim.data.site_xpos[site_id], dtype=np.float64)
+        site_rotation = np.asarray(sim.data.site_xmat[site_id], dtype=np.float64).reshape(3, 3)
+        local_position = site_rotation.T @ (target_position - site_position)
+        half_extents = np.asarray(sim.model.site_size[site_id], dtype=np.float64)
+        inside = bool(np.all(np.abs(local_position) <= half_extents + 1e-6))
+        return inside, float(np.linalg.norm(target_position - site_position))
+
+    def _task_progress(
+        self,
+        raw_obs: RobotObservation,
+        *,
+        update_stability: bool,
+    ) -> dict[str, Any]:
+        target_position, linear_velocity, angular_velocity = self._free_joint_state(self.target_object)
+        with suppress(AttributeError, KeyError, ValueError):
+            target_position = self._site_position(self.target_object, "center_site")
+        eef_position = np.asarray(raw_obs["robot0_eef_pos"], dtype=np.float64)
+        linear_speed = float(np.linalg.norm(linear_velocity))
+        angular_speed = float(np.linalg.norm(angular_velocity))
+        grasped = self._is_target_grasped()
+        inside, target_box_distance = self._target_inside_receptacle(target_position)
+        if update_stability and grasped and not self._ever_grasped:
+            self._ever_grasped = True
+            self._grasp_start_height = float(target_position[2])
+        if (
+            update_stability
+            and grasped
+            and self._grasp_start_height is not None
+            and float(target_position[2])
+            >= self._grasp_start_height + self.success_semantics.minimum_lift_height_delta
+        ):
+            self._ever_lifted = True
+        release = self._ever_grasped and not grasped
+
+        if self.success_semantics.kind == "pick_and_place":
+            stable_candidate = (
+                inside
+                and (self._ever_grasped or not self.success_semantics.require_grasp)
+                and (self._ever_lifted or self.success_semantics.minimum_lift_height_delta <= 0)
+                and (release or not self.success_semantics.require_release)
+                and linear_speed <= self.success_semantics.max_linear_speed
+                and angular_speed <= self.success_semantics.max_angular_speed
+            )
+        elif self.success_semantics.kind == "lift":
+            stable_candidate = (
+                self.success_semantics.minimum_target_height is not None
+                and float(target_position[2]) > self.success_semantics.minimum_target_height
+            )
+        else:
+            raise ValueError(f"Unknown Scene1 success semantics: {self.success_semantics.kind}")
+
+        if update_stability:
+            self._stable_success_steps = self._stable_success_steps + 1 if stable_candidate else 0
+        success = self._stable_success_steps >= self.success_semantics.stable_steps
+        return {
+            "eef_target_distance": float(np.linalg.norm(eef_position - target_position)),
+            "target_height": float(target_position[2]),
+            "target_box_distance": target_box_distance,
+            "grasped": grasped,
+            "inside": inside,
+            "release": release,
+            "ever_grasped": self._ever_grasped,
+            "ever_lifted": self._ever_lifted,
+            "linear_speed": linear_speed,
+            "angular_speed": angular_speed,
+            "stable_steps": self._stable_success_steps,
+            "success": success,
+        }
+
     def _format_raw_obs(self, raw_obs: RobotObservation) -> RobotObservation:
         assert self._env is not None
         images = {}
@@ -483,6 +665,8 @@ class Scene1LiberoEnv(gym.Env):
                     continue
                 object_xy[name] = xy
             other_object_xy = {name: xy for name, xy in object_xy.items() if name != self.target_object}
+            pose_group = SCENE1_LAYOUTS[self.layout].pose_randomization_group
+            other_object_xy = {name: xy for name, xy in other_object_xy.items() if name not in pose_group}
             self._randomization_sample = sample_scene1_randomization(
                 self.domain_randomization.profile,
                 episode_seed,
@@ -497,6 +681,10 @@ class Scene1LiberoEnv(gym.Env):
             )
             apply_scene1_randomization(
                 self._env.sim, self._randomization_baseline, self._randomization_sample
+            )
+            self._apply_grouped_pose_randomization(
+                self._randomization_baseline,
+                self._randomization_sample,
             )
         else:
             self._randomization_sample = None
@@ -525,6 +713,11 @@ class Scene1LiberoEnv(gym.Env):
             self._episode_metadata = self._make_episode_metadata(None)
         raw_obs = self._env.env._get_observations()
         self._last_raw_obs = raw_obs
+        self._step_count = 0
+        self._stable_success_steps = 0
+        self._ever_grasped = False
+        self._ever_lifted = False
+        self._grasp_start_height = None
         if self.control_mode == "absolute":
             for robot in self._env.robots:
                 robot.controller.use_delta = False
@@ -533,7 +726,12 @@ class Scene1LiberoEnv(gym.Env):
                 robot.controller.use_delta = True
         else:
             raise ValueError(f"Invalid control mode: {self.control_mode}")
-        return self._format_raw_obs(raw_obs), {"is_success": False, **self.get_episode_metadata()}
+        task_progress = self._task_progress(raw_obs, update_stability=False)
+        return self._format_raw_obs(raw_obs), {
+            "is_success": False,
+            "task_progress": task_progress,
+            **self.get_episode_metadata(),
+        }
 
     def get_episode_metadata(self) -> dict[str, Any]:
         return self._episode_metadata
@@ -547,6 +745,17 @@ class Scene1LiberoEnv(gym.Env):
                 "bddl_file": Path(self.bddl_path).name,
                 "bddl_path": self.bddl_path,
                 "target_object": self.target_object,
+                "receptacle_object": self.receptacle_object,
+                "success_semantics": {
+                    "kind": self.success_semantics.kind,
+                    "relation": self.success_semantics.relation,
+                    "require_grasp": self.success_semantics.require_grasp,
+                    "require_release": self.success_semantics.require_release,
+                    "minimum_lift_height_delta": self.success_semantics.minimum_lift_height_delta,
+                    "max_linear_speed": self.success_semantics.max_linear_speed,
+                    "max_angular_speed": self.success_semantics.max_angular_speed,
+                    "stable_steps": self.success_semantics.stable_steps,
+                },
                 "settle_steps": self.variant_settle_steps,
                 "effective_settle_steps": max(self.num_steps_wait, self.variant_settle_steps),
             },
@@ -561,13 +770,27 @@ class Scene1LiberoEnv(gym.Env):
         assert self._env is not None
         if action.ndim != 1:
             raise ValueError(f"Expected 1-D action, got {action.shape}")
-        raw_obs, reward, done, info = self._env.step(action)
+        raw_obs, _, backend_done, info = self._env.step(action)
         self._last_raw_obs = raw_obs
-        is_success = self._env.check_success()
-        terminated = bool(done or is_success)
-        info.update({"task": self.task, "task_id": self.task_id, "done": done, "is_success": is_success})
+        self._step_count += 1
+        task_progress = self._task_progress(raw_obs, update_stability=True)
+        is_success = bool(task_progress["success"])
+        terminated = is_success
+        truncated = self._step_count >= self._max_episode_steps and not terminated
+        reward = float(is_success)
+        info.update(
+            {
+                "task": self.task,
+                "task_id": self.task_id,
+                "step": self._step_count,
+                "done": terminated or truncated,
+                "backend_done": bool(backend_done),
+                "is_success": is_success,
+                "task_progress": task_progress,
+            }
+        )
         observation = self._format_raw_obs(raw_obs)
-        return observation, float(reward), terminated, False, info
+        return observation, reward, terminated, truncated, info
 
     def render(self):
         self._ensure_env()
@@ -603,6 +826,8 @@ def create_scene1_libero_envs(
         "scene_task",
         "scene_variant",
         "target_object",
+        "receptacle_object",
+        "success_semantics",
         "task_id",
         "variant_settle_steps",
         "unsupported_randomization_profiles",
@@ -639,6 +864,8 @@ def create_scene1_libero_envs(
             scene_variant=spec.variant_key,
             layout=spec.layout.key,
             target_object=spec.target_object,
+            receptacle_object=spec.semantics.receptacle_object,
+            success_semantics=spec.semantics,
             variant_settle_steps=spec.settle_steps,
             unsupported_randomization_profiles=spec.unsupported_randomization_profiles,
             **kwargs,
