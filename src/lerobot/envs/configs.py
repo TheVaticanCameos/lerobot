@@ -455,7 +455,7 @@ class Scene1LiberoEnv(EnvConfig):
     assets_root: str = "data/mujoco_scene1_libero/assets"
     prompt: str | None = None
     fps: int = 30
-    episode_length: int = 280
+    episode_length: int = 600
     obs_type: str = "pixels_agent_pos"
     render_mode: str = "rgb_array"
     camera_name: str = "agentview_image,robot0_eye_in_hand_image"
@@ -525,6 +525,31 @@ class Scene1LiberoEnv(EnvConfig):
         return (
             PolicyProcessorPipeline(steps=[LiberoProcessorStep()]),
             PolicyProcessorPipeline(steps=[]),
+        )
+
+
+@EnvConfig.register_subclass("hybrid1_libero")
+@dataclass
+class Hybrid1LiberoEnv(Scene1LiberoEnv):
+    task: str = "hybrid1_libero"
+    scene_task: str = "pick_and_place_fruit"
+    scene_variant: str | None = "full_scene"
+    bddl_path: str | None = None
+    assets_root: str = "data/mujoco_hybrid1_libero"
+    prompt: str | None = None
+
+    def create_envs(self, n_envs: int, use_async_envs: bool = False):
+        from .hybrid1_libero import create_hybrid1_libero_envs
+
+        return create_hybrid1_libero_envs(
+            n_envs=n_envs,
+            env_cls=_make_vec_env_cls(use_async_envs, n_envs),
+            scene_task=self.scene_task,
+            scene_variant=self.scene_variant,
+            assets_root=self.assets_root,
+            bddl_path=self.bddl_path,
+            prompt=self.prompt,
+            gym_kwargs=self.gym_kwargs,
         )
 
 

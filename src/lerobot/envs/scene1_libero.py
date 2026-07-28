@@ -226,7 +226,7 @@ class Scene1LiberoEnv(gym.Env):
         bddl_path: str | Path,
         assets_root: str | Path,
         prompt: str = "pick up the magnifying glass and place it into the box",
-        episode_length: int = 280,
+        episode_length: int = 600,
         camera_name: str | Sequence[str] = "agentview_image,robot0_eye_in_hand_image",
         obs_type: str = "pixels_agent_pos",
         render_mode: str = "rgb_array",

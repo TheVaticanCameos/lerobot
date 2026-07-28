@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import re
 import xml.etree.ElementTree as ET
+from contextlib import suppress
 from pathlib import Path
 
 import numpy as np
@@ -94,13 +95,37 @@ def _format_vec(values: np.ndarray | tuple[float, ...]) -> str:
     return " ".join(f"{float(v):.9g}" for v in values)
 
 
+def _repair_mesh_topology(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
+    repaired = mesh.copy()
+    repaired.remove_unreferenced_vertices()
+    repaired.merge_vertices()
+    repaired.update_faces(repaired.unique_faces())
+    repaired.update_faces(repaired.nondegenerate_faces())
+    repaired.remove_unreferenced_vertices()
+    with suppress(Exception):
+        trimesh.repair.fill_holes(repaired)
+    try:
+        trimesh.repair.fix_normals(repaired, multibody=True)
+    except TypeError:
+        trimesh.repair.fix_normals(repaired)
+    repaired.remove_unreferenced_vertices()
+    return repaired
+
+
 def _simplify_for_collision(mesh: trimesh.Trimesh, target_faces: int) -> trimesh.Trimesh:
+    mesh = _repair_mesh_topology(mesh)
     if target_faces <= 0 or len(mesh.faces) <= target_faces:
         return mesh.copy()
     simplified = mesh.simplify_quadric_decimation(face_count=target_faces)
-    simplified.update_faces(simplified.nondegenerate_faces())
-    simplified.remove_unreferenced_vertices()
-    return simplified
+    return _repair_mesh_topology(simplified)
+
+
+def _prepare_convex_part(vertices: np.ndarray, faces: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    part = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    part = _repair_mesh_topology(part)
+    if not part.is_watertight:
+        part = _repair_mesh_topology(part.convex_hull)
+    return np.asarray(part.vertices, dtype=float), np.asarray(part.faces, dtype=np.int32)
 
 
 def _coacd_parts(
@@ -120,10 +145,8 @@ def _coacd_parts(
     except ImportError as exc:
         raise RuntimeError("collision_mode='convex' requires `pip install coacd`.") from exc
 
-    try:
+    with suppress(Exception):
         coacd.set_log_level("error")
-    except Exception:
-        pass
 
     coacd_mesh = coacd.Mesh(mesh.vertices.astype(np.float64), mesh.faces.astype(np.int32))
     parts = coacd.run_coacd(
@@ -138,7 +161,7 @@ def _coacd_parts(
         merge=True,
         seed=seed,
     )
-    return [(np.asarray(vertices, dtype=float), np.asarray(faces, dtype=np.int32)) for vertices, faces in parts]
+    return [_prepare_convex_part(vertices, faces) for vertices, faces in parts]
 
 
 def _is_convex_skip(name: str, pattern: str) -> bool:
@@ -340,16 +363,17 @@ def main() -> None:
     parser.add_argument("input", type=Path, help="Path to the source .glb file")
     parser.add_argument("--output-dir", type=Path, required=True, help="Directory for MJCF and OBJ files")
     parser.add_argument("--keep-y-up", action="store_true", help="Do not rotate GLB Y-up coordinates to MuJoCo Z-up")
-    parser.add_argument("--collision-mode", choices=["box", "convex"], default="box")
-    parser.add_argument("--convex-skip-name-regex", default=r"^table", help="Object names matching this regex keep box collision")
-    parser.add_argument("--collision-decimate-faces", type=int, default=10000)
-    parser.add_argument("--coacd-threshold", type=float, default=0.08)
+    parser.add_argument("--collision-mode", choices=["box", "convex"], default="convex")
+    # parser.add_argument("--convex-skip-name-regex", default=r"^table", help="Object names matching this regex keep box collision")
+    parser.add_argument("--convex-skip-name-regex", default="", help="Object names matching this regex keep box collision")
+    parser.add_argument("--collision-decimate-faces", type=int, default=20000)
+    parser.add_argument("--coacd-threshold", type=float, default=0.04)
     parser.add_argument("--coacd-max-convex-hull", type=int, default=16)
-    parser.add_argument("--coacd-preprocess-resolution", type=int, default=50)
-    parser.add_argument("--coacd-resolution", type=int, default=2000)
-    parser.add_argument("--coacd-mcts-nodes", type=int, default=10)
-    parser.add_argument("--coacd-mcts-iterations", type=int, default=80)
-    parser.add_argument("--coacd-max-ch-vertex", type=int, default=128)
+    parser.add_argument("--coacd-preprocess-resolution", type=int, default=70)
+    parser.add_argument("--coacd-resolution", type=int, default=3000)
+    parser.add_argument("--coacd-mcts-nodes", type=int, default=15)
+    parser.add_argument("--coacd-mcts-iterations", type=int, default=120)
+    parser.add_argument("--coacd-max-ch-vertex", type=int, default=192)
     parser.add_argument("--coacd-seed", type=int, default=0)
     args = parser.parse_args()
 
