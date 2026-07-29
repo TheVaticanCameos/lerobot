@@ -528,6 +528,48 @@ class Scene1LiberoEnv(EnvConfig):
         )
 
 
+@EnvConfig.register_subclass("scene1_generated_variant")
+@dataclass
+class Scene1GeneratedVariantEnv(Scene1LiberoEnv):
+    task: str = "scene1_generated_variant"
+    scene_variant: str | None = None
+    object_poses: dict[str, dict[str, list[float]]] = field(default_factory=dict)
+    placement_mode: str = "tabletop"
+    generated_settle_steps: int = 40
+    maximum_position_drift_m: float = 0.03
+    maximum_orientation_drift_rad: float = 0.35
+
+    @property
+    def gym_kwargs(self) -> dict:
+        kwargs = dict(super().gym_kwargs)
+        kwargs.pop("domain_randomization", None)
+        return kwargs
+
+    def create_envs(self, n_envs: int, use_async_envs: bool = False):
+        from .scene1_generated_variant import create_scene1_generated_variant_envs
+
+        if self.scene_variant is None or self.bddl_path is None:
+            raise ValueError(
+                "Generated Scene1 config requires scene_variant hash and bddl_path."
+            )
+        if self.domain_randomization.enabled:
+            raise ValueError("Generated Scene1 training does not accept domain randomization.")
+        return create_scene1_generated_variant_envs(
+            n_envs=n_envs,
+            env_cls=_make_vec_env_cls(use_async_envs, n_envs),
+            bddl_path=self.bddl_path,
+            assets_root=self.assets_root,
+            variant_hash=self.scene_variant,
+            object_poses=self.object_poses,
+            placement_mode=self.placement_mode,
+            generated_settle_steps=self.generated_settle_steps,
+            maximum_position_drift_m=self.maximum_position_drift_m,
+            maximum_orientation_drift_rad=self.maximum_orientation_drift_rad,
+            prompt=self.prompt,
+            gym_kwargs=self.gym_kwargs,
+        )
+
+
 @EnvConfig.register_subclass("hybrid1_libero")
 @dataclass
 class Hybrid1LiberoEnv(Scene1LiberoEnv):
