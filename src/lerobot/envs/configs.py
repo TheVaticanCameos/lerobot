@@ -574,7 +574,7 @@ class Scene1GeneratedVariantEnv(Scene1LiberoEnv):
 @dataclass
 class Hybrid1LiberoEnv(Scene1LiberoEnv):
     task: str = "hybrid1_libero"
-    scene_task: str = "pick_and_place_fruit"
+    scene_task: str = "pick_and_place_bottle"
     scene_variant: str | None = "full_scene"
     bddl_path: str | None = None
     assets_root: str = "data/mujoco_hybrid1_libero"

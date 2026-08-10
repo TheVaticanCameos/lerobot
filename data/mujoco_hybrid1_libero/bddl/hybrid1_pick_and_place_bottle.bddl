@@ -1,0 +1,39 @@
+(define (problem Hybrid1_Tabletop_Manipulation)
+  (:domain robosuite)
+  (:language pick up the bottle and place it into the box)
+  (:regions
+    (fruit_region (:target main_table) (:ranges ((-0.28 -0.28 -0.20 -0.20))))
+    (toolbox_region (:target main_table) (:ranges ((-0.24 0.015 -0.025 0.275))))
+    (plate_region (:target main_table) (:ranges ((0.008 -0.267 0.259 -0.016))))
+    (bottle_region (:target main_table) (:ranges ((-0.106 -0.152 -0.070 -0.116))))
+    (toy_car_region (:target main_table) (:ranges ((0.052 0.051 0.229 0.177))))
+  )
+
+  (:fixtures
+    main_table - table
+  )
+
+  (:objects
+    hybrid1_fruit_1 - hybrid1_fruit
+    hybrid1_toolbox_1 - hybrid1_toolbox
+    hybrid1_plate_1 - hybrid1_plate
+    hybrid1_bottle_1 - hybrid1_bottle
+    hybrid1_toy_car_1 - hybrid1_toy_car
+  )
+
+  (:obj_of_interest
+    hybrid1_bottle_1
+  )
+
+  (:init
+    (On hybrid1_fruit_1 main_table_fruit_region)
+    (On hybrid1_toolbox_1 main_table_toolbox_region)
+    (On hybrid1_plate_1 main_table_plate_region)
+    (On hybrid1_bottle_1 main_table_bottle_region)
+    (On hybrid1_toy_car_1 main_table_toy_car_region)
+  )
+
+  (:goal
+    (And (In hybrid1_bottle_1 hybrid1_toolbox_1))
+  )
+)

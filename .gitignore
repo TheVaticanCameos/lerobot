@@ -179,3 +179,12 @@ outputs/
 
 eval_logs
 data
+
+# Canonical Hybrid1 task definitions are source inputs, not generated datasets.
+!data/
+data/*
+!data/mujoco_hybrid1_libero/
+data/mujoco_hybrid1_libero/*
+!data/mujoco_hybrid1_libero/bddl/
+data/mujoco_hybrid1_libero/bddl/*
+!data/mujoco_hybrid1_libero/bddl/hybrid1_pick_and_place_bottle.bddl

@@ -69,21 +69,47 @@ def test_scene1_asset_manifest_contains_only_variant_inventory() -> None:
     ]
 
 
-def test_hybrid1_plugin_binds_glb_derived_runtime_assets() -> None:
+@pytest.mark.parametrize(
+    ("task_id", "semantics_id", "semantics_version", "instruction", "target"),
+    (
+        (
+            "pick_and_place_bottle",
+            "hybrid1.pick_and_place_bottle",
+            1,
+            "pick up the bottle and place it into the box",
+            "hybrid1_bottle_1",
+        ),
+        (
+            "pick_and_place_fruit",
+            "hybrid1.pick_and_place_fruit",
+            2,
+            "pick up the fruit and place it into the box",
+            "hybrid1_fruit_1",
+        ),
+    ),
+)
+def test_hybrid1_plugin_binds_glb_derived_runtime_assets(
+    task_id: str,
+    semantics_id: str,
+    semantics_version: int,
+    instruction: str,
+    target: str,
+) -> None:
     resolved = HYBRID1_LIBERO_SCENE_PLUGIN.resolve(
         LiberoSceneTaskRequest(
             scene_id="hybrid1",
-            task_id="pick_and_place_fruit",
+            task_id=task_id,
             variant_id="full_scene",
         )
     )
     logical_paths = {item.logical_path for item in resolved.asset_files}
 
     assert resolved.env_type == "hybrid1_libero"
-    assert resolved.scene_version == 2
-    assert resolved.semantics_id == "hybrid1.pick_and_place_fruit"
-    assert resolved.semantics_version == 2
-    assert resolved.instruction == "pick up the fruit and place it into the box"
+    assert resolved.scene_version == 3
+    assert resolved.semantics_id == semantics_id
+    assert resolved.semantics_version == semantics_version
+    assert resolved.instruction == instruction
+    assert resolved.task_metadata["target_object"] == target
     assert resolved.task_metadata["source_scene"] == "hybrid_1.glb"
     assert "assets/arenas/hybrid1_tabletop.xml" in logical_paths
     assert "converted_scene/meshes/table_2.obj" in logical_paths

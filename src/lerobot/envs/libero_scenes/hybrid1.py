@@ -6,11 +6,10 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from lerobot.envs.hybrid1_specs import (
+    HYBRID1_BOTTLE_TASK_ID,
+    HYBRID1_FRUIT_TASK_ID,
     HYBRID1_SCENE_ID,
     HYBRID1_SCENE_VERSION,
-    HYBRID1_SEMANTICS_ID,
-    HYBRID1_SEMANTICS_VERSION,
-    HYBRID1_TASK_ID,
     resolve_hybrid1_specs,
     validate_hybrid1_bddl,
 )
@@ -53,7 +52,7 @@ class Hybrid1LiberoScenePlugin:
     descriptor: LiberoSceneDescriptor = LiberoSceneDescriptor(
         scene_id=HYBRID1_SCENE_ID,
         scene_version=HYBRID1_SCENE_VERSION,
-        task_ids=(HYBRID1_TASK_ID,),
+        task_ids=(HYBRID1_BOTTLE_TASK_ID, HYBRID1_FRUIT_TASK_ID),
     )
 
     def resolve(self, request: LiberoSceneTaskRequest) -> ResolvedLiberoSceneTask:
@@ -173,8 +172,8 @@ class Hybrid1LiberoScenePlugin:
             task_id=spec.task_key,
             variant_id=spec.variant_key,
             instruction=spec.prompt,
-            semantics_id=HYBRID1_SEMANTICS_ID,
-            semantics_version=HYBRID1_SEMANTICS_VERSION,
+            semantics_id=spec.semantics_id,
+            semantics_version=spec.semantics_version,
             success=ResolvedSuccessContract(success_kind, 1, success),
             bddl=_file(f"bddl/{bddl_path.name}", bddl_path, "task_definition"),
             assets_root=assets_root,
@@ -184,6 +183,7 @@ class Hybrid1LiberoScenePlugin:
             task_metadata={
                 "source_scene": "hybrid_1.glb",
                 "target_object": spec.target_object,
+                "target_object_category": spec.target_object.rsplit("_", 1)[0],
                 "receptacle_object": spec.semantics.receptacle_object,
                 "object_names": sorted(inventory.object_names),
             },
