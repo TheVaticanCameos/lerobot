@@ -17,6 +17,7 @@ from __future__ import annotations
 import abc
 import importlib
 from dataclasses import dataclass, field, fields
+from pathlib import Path
 from typing import Any
 
 import draccus
@@ -897,4 +898,136 @@ class RoboMMEEnv(EnvConfig):
             episode_length=self.episode_length,
             task_ids=self.task_ids,
             env_cls=env_cls,
+        )
+
+
+@EnvConfig.register_subclass("scene1")
+@dataclass
+class Scene1EnvConfig(EnvConfig):
+    task: str = "scene1"
+    task_ids: list[int] | None = None
+    scene_root: Path = Path("data/test_scene1")
+    fps: int = 20
+    episode_length: int | None = None
+    init_states: bool = False
+    hard_reset: bool = True
+    num_steps_wait: int = 10
+    obs_type: str = "pixels_agent_pos"
+    render_mode: str = "rgb_array"
+    camera_name: str = "agentview_image,robot0_eye_in_hand_image"
+    camera_name_mapping: dict[str, str] | None = None
+    observation_height: int = 256
+    observation_width: int = 256
+    control_mode: str = "relative"
+    success_hold_steps: int = 3
+    features: dict[str, PolicyFeature] = field(
+        default_factory=lambda: {
+            ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,)),
+        }
+    )
+    features_map: dict[str, str] = field(
+        default_factory=lambda: {
+            ACTION: ACTION,
+            OBS_STATE: OBS_STATE,
+            LIBERO_KEY_PIXELS_AGENTVIEW: f"{OBS_IMAGES}.image",
+            LIBERO_KEY_PIXELS_EYE_IN_HAND: f"{OBS_IMAGES}.image2",
+        }
+    )
+
+    def __post_init__(self):
+        if self.fps <= 0:
+            raise ValueError(f"fps must be positive, got {self.fps}")
+        if self.episode_length is not None and self.episode_length <= 0:
+            raise ValueError("episode_length must be positive")
+        if self.obs_type != "pixels_agent_pos":
+            raise ValueError("Scene1 currently only supports obs_type='pixels_agent_pos'")
+        if self.control_mode not in {"relative", "absolute"}:
+            raise ValueError("control_mode must be 'relative' or 'absolute'")
+        if not self.hard_reset and not self.init_states:
+            raise ValueError("hard_reset=False requires init_states=True")
+        if self.num_steps_wait < 0:
+            raise ValueError("num_steps_wait must be non-negative")
+        if self.success_hold_steps <= 0:
+            raise ValueError("success_hold_steps must be positive")
+        self._add_visual_features()
+        self._add_policy_state_feature()
+        self._update_camera_feature_mapping()
+
+    def _add_visual_features(self):
+        image_shape = (self.observation_height, self.observation_width, 3)
+        self.features[LIBERO_KEY_PIXELS_AGENTVIEW] = PolicyFeature(
+            type=FeatureType.VISUAL,
+            shape=image_shape,
+        )
+        self.features[LIBERO_KEY_PIXELS_EYE_IN_HAND] = PolicyFeature(
+            type=FeatureType.VISUAL,
+            shape=image_shape,
+        )
+
+    def _add_policy_state_feature(self):
+        # LiberoProcessorStep converts the raw nested robot_state into
+        # [eef_pos(3), eef_axis_angle(3), gripper_qpos(2)].
+        self.features[OBS_STATE] = PolicyFeature(
+            type=FeatureType.STATE,
+            shape=(8,),
+        )
+
+    def _update_camera_feature_mapping(self):
+        if self.camera_name_mapping is None:
+            return
+
+        agentview_key = self.camera_name_mapping.get("agentview_image", "image")
+        wrist_key = self.camera_name_mapping.get("robot0_eye_in_hand_image", "image2")
+        self.features_map[LIBERO_KEY_PIXELS_AGENTVIEW] = f"{OBS_IMAGES}.{agentview_key}"
+        self.features_map[LIBERO_KEY_PIXELS_EYE_IN_HAND] = f"{OBS_IMAGES}.{wrist_key}"
+
+    @property
+    def gym_kwargs(self) -> dict:
+        kwargs = {
+            "obs_type": self.obs_type,
+            "render_mode": self.render_mode,
+            "observation_height": self.observation_height,
+            "observation_width": self.observation_width,
+            "control_freq": self.fps,
+            "hard_reset": self.hard_reset,
+            "num_steps_wait": self.num_steps_wait,
+            "success_hold_steps": self.success_hold_steps,
+        }
+        if self.task_ids is not None:
+            kwargs["task_ids"] = self.task_ids
+
+        return kwargs
+
+    def create_envs(
+        self,
+        n_envs: int,
+        use_async_envs: bool = False,
+    ):
+        from .scene1 import create_scene1_envs
+
+        if not self.task:
+            raise ValueError("Scene1EnvConfig requires a task")
+        if n_envs <= 0:
+            raise ValueError(f"n_envs must be positive, got {n_envs}")
+        scene_root = self.scene_root.expanduser().resolve()
+        if not scene_root.is_dir():
+            raise FileNotFoundError(f"Scene1 root does not exist: {scene_root}")
+        env_cls = _make_vec_env_cls(use_async_envs, n_envs)
+        return create_scene1_envs(
+            task=self.task,
+            scene_root=scene_root,
+            n_envs=n_envs,
+            env_cls=env_cls,
+            camera_name=self.camera_name,
+            camera_name_mapping=self.camera_name_mapping,
+            init_states=self.init_states,
+            episode_length=self.episode_length,
+            control_mode=self.control_mode,
+            gym_kwargs=self.gym_kwargs,
+        )
+
+    def get_env_processors(self):
+        return (
+            PolicyProcessorPipeline(steps=[LiberoProcessorStep()]),
+            PolicyProcessorPipeline(steps=[]),
         )
