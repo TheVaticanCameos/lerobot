@@ -901,12 +901,13 @@ class RoboMMEEnv(EnvConfig):
         )
 
 
-@EnvConfig.register_subclass("scene1")
+@EnvConfig.register_subclass("custom_pick_place")
 @dataclass
-class Scene1EnvConfig(EnvConfig):
+class CustomPickPlaceEnvConfig(EnvConfig):
     task: str = "scene1"
     task_ids: list[int] | None = None
-    scene_root: Path = Path("data/test_scene1")
+    scene1_root: Path = Path("data/test_scene1")
+    hybrid1_root: Path = Path("data/test_hybrid1")
     fps: int = 20
     episode_length: int | None = None
     init_states: bool = False
@@ -940,7 +941,7 @@ class Scene1EnvConfig(EnvConfig):
         if self.episode_length is not None and self.episode_length <= 0:
             raise ValueError("episode_length must be positive")
         if self.obs_type != "pixels_agent_pos":
-            raise ValueError("Scene1 currently only supports obs_type='pixels_agent_pos'")
+            raise ValueError("Local pick-and-place suites only support obs_type='pixels_agent_pos'")
         if self.control_mode not in {"relative", "absolute"}:
             raise ValueError("control_mode must be 'relative' or 'absolute'")
         if not self.hard_reset and not self.init_states:
@@ -1003,19 +1004,29 @@ class Scene1EnvConfig(EnvConfig):
         n_envs: int,
         use_async_envs: bool = False,
     ):
-        from .scene1 import create_scene1_envs
+        from .custom_pick_place import create_pick_place_envs
 
         if not self.task:
-            raise ValueError("Scene1EnvConfig requires a task")
+            raise ValueError("CustomPickPlaceEnvConfig requires at least one suite name")
         if n_envs <= 0:
             raise ValueError(f"n_envs must be positive, got {n_envs}")
-        scene_root = self.scene_root.expanduser().resolve()
-        if not scene_root.is_dir():
-            raise FileNotFoundError(f"Scene1 root does not exist: {scene_root}")
+        suite_names = [name.strip() for name in self.task.split(",") if name.strip()]
+        roots = {
+            "scene1": self.scene1_root.expanduser().resolve(),
+            "hybrid1": self.hybrid1_root.expanduser().resolve(),
+        }
+        unknown_suites = set(suite_names).difference(roots)
+        if unknown_suites:
+            raise ValueError(f"Unknown pick-and-place suite(s): {sorted(unknown_suites)}")
+        for suite_name in suite_names:
+            if not roots[suite_name].is_dir():
+                raise FileNotFoundError(
+                    f"{suite_name} root does not exist: {roots[suite_name]}"
+                )
         env_cls = _make_vec_env_cls(use_async_envs, n_envs)
-        return create_scene1_envs(
+        return create_pick_place_envs(
             task=self.task,
-            scene_root=scene_root,
+            scene_roots=roots,
             n_envs=n_envs,
             env_cls=env_cls,
             camera_name=self.camera_name,

@@ -1,15 +1,15 @@
 #!/usr/bin/env python
 
-"""Scene1 task metadata and environment helpers.
+"""Local LIBERO-style pick-and-place suites for Scene1 and Hybrid1.
 
 This module intentionally mirrors the module-level organisation used by
-``lerobot.envs.libero``.  The Gymnasium wrapper and vector-environment
-factories are added separately; the code here contains only the task/suite
-adapter and the small, side-effect-free helpers they will depend on.
+``lerobot.envs.libero``.  Scene-specific differences live in immutable
+metadata; both suites reuse one Gymnasium wrapper and vector-env factory.
 """
 
 from __future__ import annotations
 
+import json
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -47,8 +47,9 @@ DEFAULT_CAMERA_NAME_MAPPING = {
 
 VALID_CONTROL_MODES = frozenset({"relative", "absolute"})
 
+
 @dataclass(frozen=True)
-class Scene1Task:
+class PickPlaceTask:
     """Task metadata exposed through the LIBERO-like suite interface."""
 
     name: str
@@ -60,10 +61,21 @@ class Scene1Task:
     max_episode_steps: int | None = None
 
 
-# Keep this order stable: it is the public mapping from task_id to task name.
-# Scene1 currently exposes one task/one BDDL only.
-SCENE1_TASKS: tuple[Scene1Task, ...] = (
-    Scene1Task(
+@dataclass(frozen=True)
+class PickPlaceScene:
+    """Resources and ordered task catalog for one local scene suite."""
+
+    name: str
+    problem_name: str
+    object_xml_dir: str
+    tasks: tuple[PickPlaceTask, ...]
+    arena_xml: str | None = None
+    nominal_layout_manifest: str | None = None
+
+
+# Keep task order stable: it is the public task_id mapping within each suite.
+SCENE1_TASKS: tuple[PickPlaceTask, ...] = (
+    PickPlaceTask(
         name="pick_and_place_magnifying_glass",
         language="pick up the magnifying glass and place it into the box",
         bddl_file="scene1_pick_and_place_magnifying_glass.bddl",
@@ -72,27 +84,82 @@ SCENE1_TASKS: tuple[Scene1Task, ...] = (
         success_type="place",
         max_episode_steps=400,
     ),
+    PickPlaceTask(
+        name="pick_and_place_magnifying_glass_sparse",
+        language="pick up the magnifying glass and place it into the box",
+        bddl_file="scene1_pick_and_place_magnifying_glass_sparse.bddl",
+        target_object="scene1_fying_glass_1",
+        receptacle="scene1_toolbox_1",
+        success_type="place",
+        max_episode_steps=400,
+    ),
+    PickPlaceTask(
+        name="pick_and_place_magnifying_glass_task_objects",
+        language="pick up the magnifying glass and place it into the box",
+        bddl_file="scene1_pick_and_place_magnifying_glass_task_objects.bddl",
+        target_object="scene1_fying_glass_1",
+        receptacle="scene1_toolbox_1",
+        success_type="place",
+        max_episode_steps=400,
+    ),
 )
 
-SCENE1_TASK_ORDER = tuple(task.name for task in SCENE1_TASKS)
-SCENE1_TASKS_BY_NAME = {task.name: task for task in SCENE1_TASKS}
+HYBRID1_TASKS: tuple[PickPlaceTask, ...] = (
+    PickPlaceTask(
+        name="pick_and_place_bottle",
+        language="pick up the bottle and place it into the box",
+        bddl_file="hybrid1_pick_and_place_bottle.bddl",
+        target_object="hybrid1_bottle_1",
+        receptacle="hybrid1_toolbox_1",
+        success_type="place",
+        max_episode_steps=400,
+    ),
+    PickPlaceTask(
+        name="pick_and_place_fruit",
+        language="pick up the fruit and place it into the box",
+        bddl_file="hybrid1_pick_and_place_fruit.bddl",
+        target_object="hybrid1_fruit_1",
+        receptacle="hybrid1_toolbox_1",
+        success_type="place",
+        max_episode_steps=400,
+    ),
+)
 
-_SCENE1_REGISTERED_ROOT: Path | None = None
+PICK_PLACE_SCENES: dict[str, PickPlaceScene] = {
+    "scene1": PickPlaceScene(
+        name="scene1",
+        problem_name="scene1_tabletop_manipulation",
+        object_xml_dir="assets/scene1_objects",
+        tasks=SCENE1_TASKS,
+    ),
+    "hybrid1": PickPlaceScene(
+        name="hybrid1",
+        problem_name="hybrid1_tabletop_manipulation",
+        object_xml_dir="assets/hybrid1_objects",
+        arena_xml="assets/arenas/hybrid1_tabletop.xml",
+        nominal_layout_manifest="assets/hybrid1_asset_manifest.json",
+        tasks=HYBRID1_TASKS,
+    ),
+}
+
+_REGISTERED_SCENE_ROOTS: dict[str, Path] = {}
 
 
-class Scene1TaskSuite:
+class PickPlaceTaskSuite:
     """Small suite adapter with the methods used by ``libero.py``.
 
     It deliberately does not register anything in LIBERO's global benchmark
-    registry.  ``Scene1Env`` can nevertheless use the same ``tasks`` /
+    registry.  ``PickPlaceEnv`` can nevertheless use the same ``tasks`` /
     ``get_task(task_id)`` protocol as the existing LIBERO wrapper.
     """
 
-    def __init__(self, scene_root: str | Path):
-        self.scene_root = resolve_scene1_root(scene_root)
-        self.tasks = SCENE1_TASKS
+    def __init__(self, scene: PickPlaceScene, scene_root: str | Path):
+        self.scene = scene
+        self.name = scene.name
+        self.scene_root = resolve_scene_root(scene, scene_root)
+        self.tasks = scene.tasks
 
-    def get_task(self, task_id: int) -> Scene1Task:
+    def get_task(self, task_id: int) -> PickPlaceTask:
         if not isinstance(task_id, (int, np.integer)):
             raise TypeError(f"task_id must be an integer, got {type(task_id).__name__}")
         task_id = int(task_id)
@@ -101,49 +168,64 @@ class Scene1TaskSuite:
         return self.tasks[task_id]
 
 
-def get_scene1_task(task: str | int) -> Scene1Task:
+def get_pick_place_scene(scene_name: str) -> PickPlaceScene:
+    try:
+        return PICK_PLACE_SCENES[scene_name]
+    except KeyError as err:
+        available = ", ".join(PICK_PLACE_SCENES)
+        raise ValueError(
+            f"Unknown pick-and-place suite '{scene_name}'. Available: {available}"
+        ) from err
+
+
+def get_pick_place_task(scene: PickPlaceScene, task: str | int) -> PickPlaceTask:
     """Resolve either a stable task name or an integer task id."""
     if isinstance(task, (int, np.integer)):
         task_id = int(task)
-        if task_id < 0 or task_id >= len(SCENE1_TASKS):
+        if task_id < 0 or task_id >= len(scene.tasks):
             raise ValueError(
-                f"task_id {task_id} out of range [0, {len(SCENE1_TASKS) - 1}]"
+                f"task_id {task_id} out of range [0, {len(scene.tasks) - 1}]"
             )
-        return SCENE1_TASKS[task_id]
-    try:
-        return SCENE1_TASKS_BY_NAME[task]
-    except KeyError as err:
-        available = ", ".join(SCENE1_TASK_ORDER)
-        raise ValueError(f"Unknown Scene1 task '{task}'. Available: {available}") from err
+        return scene.tasks[task_id]
+
+    for task_spec in scene.tasks:
+        if task_spec.name == task:
+            return task_spec
+    available = ", ".join(item.name for item in scene.tasks)
+    raise ValueError(
+        f"Unknown task '{task}' in suite '{scene.name}'. Available: {available}"
+    )
 
 
-def get_scene1_suite(scene_root: str | Path) -> Scene1TaskSuite:
-    """Create the local suite adapter used by the Scene1 vector factory."""
-    return Scene1TaskSuite(scene_root)
+def get_pick_place_suite(
+    scene_name: str,
+    scene_root: str | Path,
+) -> PickPlaceTaskSuite:
+    return PickPlaceTaskSuite(get_pick_place_scene(scene_name), scene_root)
 
 
-def parse_scene1_task_names(task: str | Sequence[str]) -> list[str]:
-    """Parse a comma-separated task argument and validate every name."""
+def parse_suite_names(task: str | Sequence[str]) -> list[str]:
+    """Parse and validate a comma-separated suite selection."""
     if isinstance(task, str):
         names = [item.strip() for item in task.split(",") if item.strip()]
     else:
         names = [str(item).strip() for item in task if str(item).strip()]
 
     if not names:
-        raise ValueError("At least one Scene1 task is required")
+        raise ValueError("At least one pick-and-place suite is required")
 
     for name in names:
-        get_scene1_task(name)
+        get_pick_place_scene(name)
     return names
 
 
-def select_scene1_task_ids(
+def select_task_ids(
     total_tasks: int,
     task_ids: Iterable[int] | None,
 ) -> list[int]:
     """Validate and normalize task ids, matching LIBERO semantics."""
     if total_tasks <= 0:
-        raise ValueError("Scene1 suite has no tasks")
+        raise ValueError("Pick-and-place suite has no tasks")
     if task_ids is None:
         return list(range(total_tasks))
 
@@ -156,44 +238,76 @@ def select_scene1_task_ids(
     return ids
 
 
-def scene1_task_name_to_id(task_name: str) -> int:
-    try:
-        return SCENE1_TASK_ORDER.index(task_name)
-    except ValueError as err:
-        available = ", ".join(SCENE1_TASK_ORDER)
-        raise ValueError(
-            f"Unknown Scene1 task '{task_name}'. Available: {available}"
-        ) from err
-
-
-def scene1_task_id_to_name(task_id: int) -> str:
-    task_id = int(task_id)
-    if task_id < 0 or task_id >= len(SCENE1_TASK_ORDER):
-        raise ValueError(f"task_id {task_id} out of range [0, {len(SCENE1_TASK_ORDER) - 1}]")
-    return SCENE1_TASK_ORDER[task_id]
-
-
-def resolve_scene1_root(scene_root: str | Path) -> Path:
-    """Resolve and validate the repository-local Scene1 asset root."""
+def resolve_scene_root(scene: PickPlaceScene, scene_root: str | Path) -> Path:
+    """Resolve and validate one repository-local suite asset root."""
     root = Path(scene_root).expanduser().resolve()
     if not root.is_dir():
-        raise FileNotFoundError(f"Scene1 root does not exist: {root}")
+        raise FileNotFoundError(f"{scene.name} root does not exist: {root}")
 
     for required in (root / "assets", root / "bddl"):
         if not required.is_dir():
             raise FileNotFoundError(
-                f"Required Scene1 directory does not exist: {required}"
+                f"Required {scene.name} directory does not exist: {required}"
             )
+    object_root = root / scene.object_xml_dir
+    if not object_root.is_dir():
+        raise FileNotFoundError(
+            f"Required {scene.name} object directory does not exist: {object_root}"
+        )
+    if scene.arena_xml is not None and not (root / scene.arena_xml).is_file():
+        raise FileNotFoundError(
+            f"Required {scene.name} arena XML does not exist: {root / scene.arena_xml}"
+        )
     return root
 
 
-def resolve_scene1_bddl(
+def load_nominal_object_positions(
+    scene: PickPlaceScene,
     scene_root: str | Path,
-    task: Scene1Task | str,
+) -> dict[str, np.ndarray]:
+    """Load GLB-derived object origins used to replace temporary BDDL poses."""
+    if scene.nominal_layout_manifest is None:
+        return {}
+
+    root = resolve_scene_root(scene, scene_root)
+    manifest_path = root / scene.nominal_layout_manifest
+    if not manifest_path.is_file():
+        raise FileNotFoundError(
+            f"Nominal layout manifest for {scene.name} does not exist: {manifest_path}"
+        )
+
+    with manifest_path.open(encoding="utf-8") as stream:
+        manifest = json.load(stream)
+    movable_objects = manifest.get("movable_objects")
+    if not isinstance(movable_objects, list) or not movable_objects:
+        raise ValueError(
+            f"Nominal layout manifest has no movable_objects: {manifest_path}"
+        )
+
+    positions: dict[str, np.ndarray] = {}
+    for item in movable_objects:
+        if not isinstance(item, dict):
+            raise ValueError(f"Invalid movable object entry in {manifest_path}")
+        category = item.get("object_category")
+        origin = np.asarray(item.get("local_origin"), dtype=np.float64)
+        if not isinstance(category, str) or origin.shape != (3,) or not np.isfinite(origin).all():
+            raise ValueError(f"Invalid movable object pose in {manifest_path}: {item}")
+        instance_name = f"{category}_1"
+        if instance_name in positions:
+            raise ValueError(
+                f"Duplicate movable object category '{category}' in {manifest_path}"
+            )
+        positions[instance_name] = origin
+    return positions
+
+
+def resolve_task_bddl(
+    scene: PickPlaceScene,
+    scene_root: str | Path,
+    task: PickPlaceTask | str,
 ) -> Path:
-    """Resolve the single supported Scene1 task's BDDL path."""
-    root = resolve_scene1_root(scene_root)
-    task_spec = get_scene1_task(task) if isinstance(task, str) else task
+    root = resolve_scene_root(scene, scene_root)
+    task_spec = get_pick_place_task(scene, task) if isinstance(task, str) else task
 
     bddl_path = root / "bddl" / task_spec.bddl_file
     if not bddl_path.is_file():
@@ -204,7 +318,7 @@ def resolve_scene1_bddl(
     return bddl_path
 
 
-def get_scene1_dummy_action() -> np.ndarray:
+def get_dummy_action() -> np.ndarray:
     """Return a no-op action used during post-reset settling."""
     return np.asarray(
         [0, 0, 0, 0, 0, 0, -1],
@@ -212,36 +326,37 @@ def get_scene1_dummy_action() -> np.ndarray:
     )
 
 
-def validate_scene1_control_mode(control_mode: str) -> None:
+def validate_control_mode(control_mode: str) -> None:
     if control_mode not in VALID_CONTROL_MODES:
         raise ValueError(
-            f"Invalid Scene1 control mode '{control_mode}'. "
+            f"Invalid pick-and-place control mode '{control_mode}'. "
             f"Expected one of {sorted(VALID_CONTROL_MODES)}"
         )
 
 
-def validate_scene1_camera_names(camera_names: Sequence[str]) -> None:
+def validate_camera_names(camera_names: Sequence[str]) -> None:
     required = set(DEFAULT_CAMERA_NAME_MAPPING)
     missing = required.difference(camera_names)
     if missing:
         raise ValueError(
-            "Scene1's LIBERO-compatible observation requires cameras "
+            "The LIBERO-compatible observation requires cameras "
             f"{sorted(required)}; missing {sorted(missing)}"
         )
 
 
-def load_scene1_init_states(
+def load_init_states(
+    scene: PickPlaceScene,
     scene_root: str | Path,
-    task: Scene1Task | str,
+    task: PickPlaceTask | str,
 ) -> Any:
-    """Load optional Scene1 initial states from ``init_states/``.
+    """Load optional initial states from a suite's ``init_states/``.
 
     The current repository does not ship this directory yet.  Keeping the
-    loader here lets ``Scene1Env`` provide a clear error when init_states is
+    loader here lets ``PickPlaceEnv`` provide a clear error when init_states is
     explicitly enabled, instead of silently falling back to random reset.
     """
-    root = resolve_scene1_root(scene_root)
-    task_spec = get_scene1_task(task) if isinstance(task, str) else task
+    root = resolve_scene_root(scene, scene_root)
+    task_spec = get_pick_place_task(scene, task) if isinstance(task, str) else task
     candidates = (
         root / "init_states" / f"{task_spec.name}.pt",
     )
@@ -249,32 +364,32 @@ def load_scene1_init_states(
     if state_path is None:
         searched = ", ".join(str(path) for path in candidates)
         raise FileNotFoundError(
-            f"No Scene1 init states found for task '{task_spec.name}'. "
+            f"No {scene.name} init states found for task '{task_spec.name}'. "
             f"Searched: {searched}"
         )
     return torch.load(state_path, weights_only=False)  # nosec B614
 
 
-def select_scene1_init_state(
+def select_init_state(
     init_states: Sequence[Any],
     episode_index: int,
 ) -> Any:
     if len(init_states) == 0:
-        raise ValueError("Scene1 init state collection is empty")
+        raise ValueError("Init state collection is empty")
     return init_states[int(episode_index) % len(init_states)]
 
 
-def _register_scene1_libero_assets(scene_root: Path) -> None:
-    """Register Scene1 BDDL problem and XML object factories in LIBERO.
+def _register_libero_assets(
+    scene: PickPlaceScene,
+    scene_root: Path,
+) -> None:
+    """Register one local BDDL problem and its XML object factories in LIBERO.
 
     LIBERO's ``OffScreenRenderEnv`` dispatches the BDDL ``problem_name``
     through a process-global ``TASK_MAPPING`` and resolves each BDDL object
-    category through ``OBJECTS_DICT``.  Scene1 is intentionally not installed
-    into the LIBERO package, so register these two small adapters lazily when
-    a worker is about to create its own simulator.
+    category through ``OBJECTS_DICT``.  Local suites are intentionally not
+    installed into LIBERO, so register these adapters lazily in each worker.
     """
-    global _SCENE1_REGISTERED_ROOT
-
     from libero.libero.envs.bddl_base_domain import register_problem
     from libero.libero.envs.base_object import OBJECTS_DICT
     from libero.libero.envs import TASK_MAPPING
@@ -282,56 +397,49 @@ def _register_scene1_libero_assets(scene_root: Path) -> None:
     from robosuite.models.objects import MujocoXMLObject
     from robosuite.utils.mjcf_utils import string_to_array
 
-    root = resolve_scene1_root(scene_root)
-    if _SCENE1_REGISTERED_ROOT is not None and _SCENE1_REGISTERED_ROOT != root:
+    root = resolve_scene_root(scene, scene_root)
+    registered_root = _REGISTERED_SCENE_ROOTS.get(scene.name)
+    if registered_root is not None and registered_root != root:
         raise RuntimeError(
-            "Scene1 assets were already registered from a different root: "
-            f"{_SCENE1_REGISTERED_ROOT}; cannot switch to {root} in one process"
+            f"{scene.name} assets were already registered from a different root: "
+            f"{registered_root}; cannot switch to {root} in one process"
         )
 
-    object_root = root / "assets" / "scene1_objects"
+    object_root = root / scene.object_xml_dir
 
-    class Scene1XMLObject(MujocoXMLObject):
-        """MujocoXMLObject adapter for Scene1's extra nested body layer."""
+    class LocalXMLObject(MujocoXMLObject):
+        """MujocoXMLObject adapter for the generated nested body layer."""
 
-        def _scene1_site_position(self, site_name: str) -> np.ndarray:
+        def _local_site_position(self, site_name: str) -> np.ndarray:
             site = self.worldbody.find(
                 f".//site[@name='{self.naming_prefix}{site_name}']"
             )
             if site is None:
                 raise ValueError(
-                    f"Scene1 object '{self.name}' has no site '{site_name}'"
+                    f"{scene.name} object '{self.name}' has no site '{site_name}'"
                 )
             return string_to_array(site.get("pos"))
 
         @property
         def bottom_offset(self) -> np.ndarray:
-            return self._scene1_site_position("bottom_site")
+            return self._local_site_position("bottom_site")
 
         @property
         def top_offset(self) -> np.ndarray:
-            return self._scene1_site_position("top_site")
+            return self._local_site_position("top_site")
 
         @property
         def horizontal_radius(self) -> float:
-            return float(self._scene1_site_position("horizontal_radius_site")[0])
+            return float(self._local_site_position("horizontal_radius_site")[0])
 
-    object_names = {
-        "scene1_blue_car",
-        "scene1_toy_car_8",
-        "scene1_toy_car_2",
-        "scene1_fying_glass",
-        "scene1_toolbox",
-        "scene1_screwdriver",
-        "scene1_bottle_4",
-        "scene1_bottle_5",
-        "scene1_bottle_6",
-    }
-    for object_name in object_names:
-        xml_path = object_root / object_name / f"{object_name}.xml"
-        if not xml_path.is_file():
-            raise FileNotFoundError(
-                f"Scene1 object XML does not exist: {xml_path}"
+    object_xml_paths = sorted(object_root.glob("*/*.xml"))
+    if not object_xml_paths:
+        raise FileNotFoundError(f"No object XML files found under {object_root}")
+    for xml_path in object_xml_paths:
+        object_name = xml_path.stem
+        if xml_path.parent.name != object_name:
+            raise ValueError(
+                f"Object XML directory and category must match: {xml_path}"
             )
 
         # Capture the path as a default argument so each factory keeps its own
@@ -344,7 +452,7 @@ def _register_scene1_libero_assets(scene_root: Path) -> None:
             _category_name=object_name,
             **kwargs,
         ):
-            obj = Scene1XMLObject(
+            obj = LocalXMLObject(
                 fname=str(_xml_path),
                 name=name,
                 joints=joints,
@@ -368,7 +476,7 @@ def _register_scene1_libero_assets(scene_root: Path) -> None:
             # root.  Keep an existing factory to avoid mutating LIBERO state.
             pass
 
-    problem_name = "scene1_tabletop_manipulation"
+    problem_name = scene.problem_name
     if problem_name not in TASK_MAPPING:
         # The register_problem decorator in this LIBERO version does not
         # return the decorated class, so import the registered base class from
@@ -377,25 +485,37 @@ def _register_scene1_libero_assets(scene_root: Path) -> None:
         if base_problem is None:
             raise RuntimeError(
                 "LIBERO tabletop problem is not registered; cannot create "
-                "the Scene1 problem adapter"
+                f"the {scene.name} problem adapter"
             )
 
-        @register_problem
-        class Scene1_Tabletop_Manipulation(base_problem):
-            pass
+        if scene.name == "scene1":
 
-    # Scene1 uses the same ``main_table - table`` workspace declaration as
-    # LIBERO tabletop tasks, so share the corresponding sampler class.
+            @register_problem
+            class Scene1_Tabletop_Manipulation(base_problem):
+                pass
+
+        elif scene.name == "hybrid1":
+
+            @register_problem
+            class Hybrid1_Tabletop_Manipulation(base_problem):
+                pass
+
+        else:
+            raise ValueError(
+                f"No LIBERO problem class declaration for suite '{scene.name}'"
+            )
+
+    # Both suites use LIBERO's ``main_table - table`` workspace declaration.
     REGION_SAMPLERS.setdefault(
         problem_name,
         dict(REGION_SAMPLERS["libero_tabletop_manipulation"]),
     )
 
-    _SCENE1_REGISTERED_ROOT = root
+    _REGISTERED_SCENE_ROOTS[scene.name] = root
 
 
-class Scene1Env(gym.Env):
-    """Gymnasium wrapper for the single Scene1 pick-and-place task.
+class PickPlaceEnv(gym.Env):
+    """Shared Gymnasium wrapper for local LIBERO pick-and-place suites.
 
     The wrapper intentionally follows ``lerobot.envs.libero.LiberoEnv``'s
     observation and lifecycle contract.  The underlying MuJoCo renderer is
@@ -407,7 +527,7 @@ class Scene1Env(gym.Env):
 
     def __init__(
         self,
-        task_suite: Scene1TaskSuite,
+        task_suite: PickPlaceTaskSuite,
         task_id: int,
         task_suite_name: str = "scene1",
         scene_root: str | Path = "data/test_scene1",
@@ -431,9 +551,9 @@ class Scene1Env(gym.Env):
     ):
         super().__init__()
 
-        if not isinstance(task_suite, Scene1TaskSuite):
+        if not isinstance(task_suite, PickPlaceTaskSuite):
             raise TypeError(
-                "task_suite must be a Scene1TaskSuite, "
+                "task_suite must be a PickPlaceTaskSuite, "
                 f"got {type(task_suite).__name__}"
             )
         if control_freq <= 0:
@@ -448,19 +568,25 @@ class Scene1Env(gym.Env):
             raise ValueError("num_steps_wait must be non-negative")
         if success_hold_steps <= 0:
             raise ValueError("success_hold_steps must be positive")
-        validate_scene1_control_mode(control_mode)
+        validate_control_mode(control_mode)
 
         self.task_suite = task_suite
+        self.scene = task_suite.scene
         self.task_id = int(task_id)
         self.task_suite_name = task_suite_name
         self._task_spec = task_suite.get_task(self.task_id)
         self.task = self._task_spec.name
         self.task_description = self._task_spec.language
 
-        self.scene_root = resolve_scene1_root(scene_root)
-        self._task_bddl_file = resolve_scene1_bddl(
+        self.scene_root = resolve_scene_root(self.scene, scene_root)
+        self._task_bddl_file = resolve_task_bddl(
+            self.scene,
             self.scene_root,
             self._task_spec,
+        )
+        self._nominal_object_positions = load_nominal_object_positions(
+            self.scene,
+            self.scene_root,
         )
 
         self.obs_type = obs_type
@@ -474,7 +600,7 @@ class Scene1Env(gym.Env):
         if camera_name_mapping is None:
             camera_name_mapping = dict(DEFAULT_CAMERA_NAME_MAPPING)
         self.camera_name_mapping = camera_name_mapping
-        validate_scene1_camera_names(self.camera_name)
+        validate_camera_names(self.camera_name)
 
         self.num_steps_wait = num_steps_wait
         self.control_freq = control_freq
@@ -495,11 +621,12 @@ class Scene1Env(gym.Env):
         self.init_state_id = int(episode_index)
 
         self._init_states = (
-            load_scene1_init_states(self.scene_root, self._task_spec)
+            load_init_states(self.scene, self.scene_root, self._task_spec)
             if self.init_states
             else None
         )
         self._env: OffScreenRenderEnv | None = None
+        self._pending_reset_render: np.ndarray | None = None
         self._episode_step = 0
         self._success_streak = 0
         self._target_initial_pos: np.ndarray | None = None
@@ -586,7 +713,7 @@ class Scene1Env(gym.Env):
             )
         else:
             raise NotImplementedError(
-                "Scene1 supports only image observations: "
+                "Local pick-and-place suites support only image observations: "
                 "'pixels' or 'pixels_agent_pos'"
             )
 
@@ -602,21 +729,42 @@ class Scene1Env(gym.Env):
         if self._env is not None:
             return
 
-        _register_scene1_libero_assets(self.scene_root)
+        _register_libero_assets(self.scene, self.scene_root)
+        env_kwargs = {
+            "bddl_file_name": str(self._task_bddl_file),
+            "camera_heights": self.observation_height,
+            "camera_widths": self.observation_width,
+            "control_freq": self.control_freq,
+            "hard_reset": self.hard_reset,
+        }
+        if self.scene.arena_xml is not None:
+            env_kwargs["scene_xml"] = str(
+                self.scene_root / self.scene.arena_xml
+            )
         env = OffScreenRenderEnv(
-            bddl_file_name=str(self._task_bddl_file),
-            camera_heights=self.observation_height,
-            camera_widths=self.observation_width,
-            control_freq=self.control_freq,
-            hard_reset=self.hard_reset,
+            **env_kwargs,
         )
-        env.reset()
         self._env = env
+        env.reset()
+        # OffScreenRenderEnv needs an eager reset to finish constructing the
+        # simulator. Do not leave that otherwise-unobservable reset in the
+        # temporary BDDL parking layout: some vector/video paths can render
+        # the environment before the explicit episode reset has refreshed the
+        # camera buffer, producing a one-frame flash of the parking layout.
+        self._apply_nominal_scene_layout()
+        env.env._get_observations(force_update=True)
 
     def render(self):
         self._ensure_env()
         assert self._env is not None
-        raw_obs = self._env.env._get_observations()
+        if self._pending_reset_render is not None:
+            # The eval recorder renders once immediately after vector reset.
+            # Return the exact post-reset observation rather than a camera
+            # buffer left over from OffScreenRenderEnv's construction reset.
+            image = self._pending_reset_render
+            self._pending_reset_render = None
+            return image
+        raw_obs = self._env.env._get_observations(force_update=True)
         pixels = self._format_raw_obs(raw_obs)["pixels"]
         image = next(iter(pixels.values()))
         return image[::-1, ::-1]
@@ -628,7 +776,7 @@ class Scene1Env(gym.Env):
         for camera_name in self.camera_name:
             if camera_name not in raw_obs:
                 raise ValueError(
-                    f"Raw Scene1 observation has no camera '{camera_name}'. "
+                    f"Raw {self.scene.name} observation has no camera '{camera_name}'. "
                     f"Available keys: {sorted(raw_obs)}"
                 )
             images[self.camera_name_mapping[camera_name]] = raw_obs[camera_name]
@@ -662,7 +810,7 @@ class Scene1Env(gym.Env):
                 missing.append("robot0_gripper_qpos")
             if missing:
                 raise ValueError(
-                    "Missing required Scene1 robot state fields: "
+                    f"Missing required {self.scene.name} robot state fields: "
                     + ", ".join(missing)
                 )
 
@@ -695,15 +843,39 @@ class Scene1Env(gym.Env):
         for robot in self._env.robots:
             robot.controller.use_delta = use_delta
 
+    def _apply_nominal_scene_layout(self) -> None:
+        """Restore the GLB layout after LIBERO's temporary region placement."""
+        if not self._nominal_object_positions:
+            return
+
+        sim = self._get_sim()
+        for object_name, position in self._nominal_object_positions.items():
+            joint_name = f"{object_name}_joint0"
+            try:
+                joint_id = sim.model.joint_name2id(joint_name)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Could not restore {self.scene.name} object '{object_name}': "
+                    f"free joint '{joint_name}' is missing"
+                ) from exc
+            qpos_address = int(sim.model.jnt_qposadr[joint_id])
+            dof_address = int(sim.model.jnt_dofadr[joint_id])
+            sim.data.qpos[qpos_address : qpos_address + 3] = position
+            # Generated Hybrid1 objects are recentered in world-aligned local
+            # coordinates, so the source-scene orientation is identity (WXYZ).
+            sim.data.qpos[qpos_address + 3 : qpos_address + 7] = np.asarray(
+                [1.0, 0.0, 0.0, 0.0], dtype=np.float64
+            )
+            sim.data.qvel[dof_address : dof_address + 6] = 0.0
+        sim.forward()
+
     def _get_sim(self):
         """Return the robosuite simulation object used by success checks."""
         assert self._env is not None
         inner = getattr(self._env, "env", self._env)
         sim = getattr(inner, "sim", None)
         if sim is None:
-            raise RuntimeError(
-                "Scene1 success checks require the underlying robosuite sim"
-            )
+            raise RuntimeError("Success checks require the underlying robosuite sim")
         return sim
 
     def _body_position(self, body_name: str) -> np.ndarray:
@@ -715,7 +887,7 @@ class Scene1Env(gym.Env):
             body_id = model.body_name2id(body_name)
         except Exception as exc:
             raise RuntimeError(
-                f"Could not find Scene1 body '{body_name}'"
+                f"Could not find {self.scene.name} body '{body_name}'"
             ) from exc
         return np.asarray(data.body_xpos[body_id], dtype=np.float64).copy()
 
@@ -728,7 +900,7 @@ class Scene1Env(gym.Env):
             body_id = model.body_name2id(body_name)
         except Exception as exc:
             raise RuntimeError(
-                f"Could not find Scene1 body '{body_name}'"
+                f"Could not find {self.scene.name} body '{body_name}'"
             ) from exc
 
         # MuJoCo cvel is [angular velocity, linear velocity].
@@ -749,7 +921,7 @@ class Scene1Env(gym.Env):
             site_id = sim.model.site_name2id(site_name)
         except Exception as exc:
             raise RuntimeError(
-                f"Could not find Scene1 site '{site_name}'"
+                f"Could not find {self.scene.name} site '{site_name}'"
             ) from exc
         return np.asarray(sim.data.site_xpos[site_id], dtype=np.float64).copy()
 
@@ -805,7 +977,7 @@ class Scene1Env(gym.Env):
             return False
         # Robosuite's parallel gripper qpos is positive when opening.  Keep
         # this threshold conservative; it can be tuned after observing the
-        # actual Scene1 controller range.
+        # actual controller range.
         return bool(float(np.mean(qpos)) > 0.02)
 
     def _check_pick_success(self) -> bool:
@@ -834,13 +1006,13 @@ class Scene1Env(gym.Env):
         self._success_streak = self._success_streak + 1 if valid else 0
         return self._success_streak >= self.success_hold_steps
 
-    def _check_scene1_success(self) -> bool:
+    def _check_task_success(self) -> bool:
         if self._task_spec.success_type == "pick":
             return self._check_pick_success()
         if self._task_spec.success_type == "place":
             return self._check_place_success()
         raise ValueError(
-            f"Unknown Scene1 success type '{self._task_spec.success_type}'"
+            f"Unknown success type '{self._task_spec.success_type}'"
         )
 
     def reset(self, seed=None, **kwargs):
@@ -851,16 +1023,31 @@ class Scene1Env(gym.Env):
         self._env.seed(seed)
         raw_obs = self._env.reset()
 
-        if self.init_states and self._init_states is not None:
-            init_state = select_scene1_init_state(
+        using_init_state = self.init_states and self._init_states is not None
+        if using_init_state:
+            init_state = select_init_state(
                 self._init_states,
                 self.init_state_id,
             )
             raw_obs = self._env.set_init_state(init_state)
             self.init_state_id += self._reset_stride
+        else:
+            # Hybrid1's BDDL regions are only collision-free parking regions.
+            # Restore the source GLB layout before settling, then restore it
+            # once more afterwards so the policy observes the canonical pose.
+            self._apply_nominal_scene_layout()
 
         for _ in range(self.num_steps_wait):
-            raw_obs, _, _, _ = self._env.step(get_scene1_dummy_action())
+            raw_obs, _, _, _ = self._env.step(get_dummy_action())
+
+        if not using_init_state:
+            self._apply_nominal_scene_layout()
+            # Direct qpos writes plus sim.forward() do not invalidate
+            # robosuite Observable caches. This is especially visible when
+            # num_steps_wait=0: without force_update the reset observation is
+            # still the BDDL parking layout even though MuJoCo body_xpos is
+            # already nominal.
+            raw_obs = self._env.env._get_observations(force_update=True)
 
         self._set_control_mode()
         self._episode_step = 0
@@ -870,6 +1057,8 @@ class Scene1Env(gym.Env):
         )
 
         observation = self._format_raw_obs(raw_obs)
+        reset_image = next(iter(observation["pixels"].values()))
+        self._pending_reset_render = reset_image[::-1, ::-1].copy()
         info = {
             "task": self.task,
             "task_id": self.task_id,
@@ -889,7 +1078,7 @@ class Scene1Env(gym.Env):
 
         raw_obs, reward, simulator_done, info = self._env.step(action)
         self._episode_step += 1
-        is_success = self._check_scene1_success()
+        is_success = self._check_task_success()
         terminated = bool(simulator_done or is_success)
         truncated = bool(
             self._episode_step >= self._max_episode_steps and not terminated
@@ -913,11 +1102,12 @@ class Scene1Env(gym.Env):
                 self._env.close()
             finally:
                 self._env = None
+                self._pending_reset_render = None
 
 
 def _make_env_fns(
     *,
-    task_suite: Scene1TaskSuite,
+    task_suite: PickPlaceTaskSuite,
     scene_root: str | Path,
     task_id: int,
     n_envs: int,
@@ -927,27 +1117,26 @@ def _make_env_fns(
     gym_kwargs: Mapping[str, Any],
     control_mode: str,
     camera_name_mapping: dict[str, str] | None = None,
-) -> list[Callable[[], Scene1Env]]:
-    """Build ``n_envs`` factories for one Scene1 task.
+) -> list[Callable[[], PickPlaceEnv]]:
+    """Build ``n_envs`` factories for one local pick-and-place task.
 
     This follows LIBERO's factory shape closely.  Each callable captures only
-    serializable/configuration data; ``Scene1Env`` creates MuJoCo lazily in
+    serializable/configuration data; ``PickPlaceEnv`` creates MuJoCo lazily in
     the worker when reset() is first called.
     """
     if not isinstance(n_envs, int) or n_envs <= 0:
         raise ValueError(f"n_envs must be a positive int; got {n_envs}")
 
     local_gym_kwargs = dict(gym_kwargs)
-    # task_ids is consumed by create_scene1_envs(), not by each individual
-    # Scene1Env.  Popping it here also prevents duplicate/unexpected kwargs.
+    # task_ids is consumed by the suite factory, not by each environment.
     local_gym_kwargs.pop("task_ids", None)
 
-    def _make_env(episode_index: int, **kwargs) -> Scene1Env:
+    def _make_env(episode_index: int, **kwargs) -> PickPlaceEnv:
         local_kwargs = dict(kwargs)
-        return Scene1Env(
+        return PickPlaceEnv(
             task_suite=task_suite,
             task_id=task_id,
-            task_suite_name="scene1",
+            task_suite_name=task_suite.name,
             scene_root=scene_root,
             camera_name=camera_names,
             init_states=init_states,
@@ -965,11 +1154,11 @@ def _make_env_fns(
     ]
 
 
-def create_scene1_envs(
+def create_pick_place_envs(
     task: str = "scene1",
     n_envs: int = 1,
     gym_kwargs: dict[str, Any] | None = None,
-    scene_root: str | Path = "data/test_scene1",
+    scene_roots: Mapping[str, str | Path] | None = None,
     camera_name: str | Sequence[str] = DEFAULT_CAMERA_NAME,
     init_states: bool = False,
     env_cls: Callable[[Sequence[Callable[[], Any]]], Any] | None = None,
@@ -977,11 +1166,11 @@ def create_scene1_envs(
     episode_length: int | None = None,
     camera_name_mapping: dict[str, str] | None = None,
 ) -> dict[str, dict[int, Any]]:
-    """Create Scene1 vector environments in LIBERO's return format.
+    """Create Scene1/Hybrid1 vector environments in LIBERO's suite format.
 
-    The ``task`` argument is suite-style and currently must be ``"scene1"``.
-    ``task_ids`` can be supplied inside ``gym_kwargs``; if omitted, the sole
-    Scene1 task (task_id 0) is selected.
+    ``task`` accepts ``scene1``, ``hybrid1``, or a comma-separated selection.
+    ``task_ids`` in ``gym_kwargs`` applies within every selected suite; omit
+    it when selecting both suites to evaluate all five tasks.
     """
     if env_cls is None or not callable(env_cls):
         raise ValueError(
@@ -994,73 +1183,78 @@ def create_scene1_envs(
     gym_kwargs = dict(gym_kwargs or {})
     task_ids_filter = gym_kwargs.pop("task_ids", None)
 
-    suite_names = [name.strip() for name in str(task).split(",") if name.strip()]
-    if not suite_names:
-        raise ValueError("`task` must contain the Scene1 suite name 'scene1'")
-    unknown_suites = [name for name in suite_names if name != "scene1"]
-    if unknown_suites:
-        raise ValueError(
-            f"Unknown Scene1 suite(s) {unknown_suites}; only 'scene1' is supported"
-        )
+    suite_names = parse_suite_names(task)
+    roots = {
+        "scene1": Path("data/test_scene1"),
+        "hybrid1": Path("data/test_hybrid1"),
+    }
+    if scene_roots is not None:
+        unknown_roots = set(scene_roots).difference(PICK_PLACE_SCENES)
+        if unknown_roots:
+            raise ValueError(f"Unknown suite root override(s): {sorted(unknown_roots)}")
+        roots.update({name: Path(path) for name, path in scene_roots.items()})
 
     camera_names = parse_camera_names(camera_name)
-    validate_scene1_camera_names(camera_names)
-    suite = get_scene1_suite(scene_root)
-    selected = select_scene1_task_ids(len(suite.tasks), task_ids_filter)
-    if not selected:
-        raise ValueError("No Scene1 task_ids were selected")
-
-    print(
-        f"Creating Scene1 envs | task_ids={selected} | "
-        f"n_envs(per task)={n_envs} | init_states={init_states}"
-    )
+    validate_camera_names(camera_names)
 
     is_async = env_cls is gym.vector.AsyncVectorEnv
     is_sync = env_cls is gym.vector.SyncVectorEnv
 
     out: dict[str, dict[int, Any]] = defaultdict(dict)
-    cached_obs_space: spaces.Space | None = None
-    cached_act_space: spaces.Space | None = None
-    cached_metadata: dict[str, Any] | None = None
+    cached_spaces: tuple[spaces.Space, spaces.Space, dict[str, Any]] | None = None
 
-    for task_id in selected:
-        fns = _make_env_fns(
-            task_suite=suite,
-            scene_root=suite.scene_root,
-            task_id=task_id,
-            n_envs=n_envs,
-            camera_names=camera_names,
-            episode_length=episode_length,
-            init_states=init_states,
-            gym_kwargs=gym_kwargs,
-            control_mode=control_mode,
-            camera_name_mapping=camera_name_mapping,
-        )
-
-        if is_async:
-            # As in libero.py, lazy construction avoids creating an EGL/MuJoCo
-            # context in the parent process before worker creation.
-            vec_env = _LazyAsyncVectorEnv(
-                fns,
-                cached_obs_space,
-                cached_act_space,
-                cached_metadata,
-            )
-            if cached_obs_space is None:
-                cached_obs_space = vec_env.observation_space
-                cached_act_space = vec_env.action_space
-                cached_metadata = vec_env.metadata
-        elif is_sync:
-            vec_env = gym.vector.SyncVectorEnv(
-                fns,
-                autoreset_mode=gym.vector.AutoresetMode.NEXT_STEP,
-            )
-        else:
-            vec_env = env_cls(fns)
-
-        out["scene1"][task_id] = vec_env
+    for suite_name in suite_names:
+        suite = get_pick_place_suite(suite_name, roots[suite_name])
+        selected = select_task_ids(len(suite.tasks), task_ids_filter)
+        if not selected:
+            raise ValueError(f"No task_ids were selected for suite '{suite_name}'")
         print(
-            f"Built Scene1 vec env | task_id={task_id} | n_envs={n_envs}"
+            f"Creating {suite_name} envs | task_ids={selected} | "
+            f"n_envs(per task)={n_envs} | init_states={init_states}"
         )
+
+        for task_id in selected:
+            fns = _make_env_fns(
+                task_suite=suite,
+                scene_root=suite.scene_root,
+                task_id=task_id,
+                n_envs=n_envs,
+                camera_names=camera_names,
+                episode_length=episode_length,
+                init_states=init_states,
+                gym_kwargs=gym_kwargs,
+                control_mode=control_mode,
+                camera_name_mapping=camera_name_mapping,
+            )
+
+            if is_async:
+                cached_obs, cached_act, cached_metadata = (
+                    cached_spaces if cached_spaces is not None else (None, None, None)
+                )
+                vec_env = _LazyAsyncVectorEnv(
+                    fns,
+                    cached_obs,
+                    cached_act,
+                    cached_metadata,
+                )
+                if cached_spaces is None:
+                    cached_spaces = (
+                        vec_env.observation_space,
+                        vec_env.action_space,
+                        vec_env.metadata,
+                    )
+            elif is_sync:
+                vec_env = gym.vector.SyncVectorEnv(
+                    fns,
+                    autoreset_mode=gym.vector.AutoresetMode.NEXT_STEP,
+                )
+            else:
+                vec_env = env_cls(fns)
+
+            out[suite_name][task_id] = vec_env
+            print(
+                f"Built {suite_name} vec env | task_id={task_id} | "
+                f"task={suite.tasks[task_id].name} | n_envs={n_envs}"
+            )
 
     return {suite_name: dict(task_map) for suite_name, task_map in out.items()}
