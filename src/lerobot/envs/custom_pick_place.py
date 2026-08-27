@@ -432,6 +432,31 @@ def _register_libero_assets(
         def horizontal_radius(self) -> float:
             return float(self._local_site_position("horizontal_radius_site")[0])
 
+        def in_box(self, position: np.ndarray, object_position: np.ndarray) -> bool:
+            """Containment test for LIBERO's ``In`` predicate.
+
+            ``position`` is this container's world body position and
+            ``object_position`` is the candidate object's world position
+            (rotation is ignored, matching the ``ObjectState.check_contain``
+            call signature).  The containment volume is declared by the
+            ``containment_site`` box site in the object XML.
+            """
+            site = self.worldbody.find(
+                f".//site[@name='{self.naming_prefix}containment_site']"
+            )
+            if site is None:
+                raise ValueError(
+                    f"{scene.name} object '{self.name}' has no site 'containment_site'"
+                )
+            half_size = string_to_array(site.get("size"))
+            center = position + string_to_array(site.get("pos"))
+            lower = center - half_size
+            lower[2] -= 0.01  # same fudge factor as robosuite CompositeObject.in_box
+            return bool(
+                np.all(object_position > lower)
+                and np.all(object_position < center + half_size)
+            )
+
     object_xml_paths = sorted(object_root.glob("*/*.xml"))
     if not object_xml_paths:
         raise FileNotFoundError(f"No object XML files found under {object_root}")

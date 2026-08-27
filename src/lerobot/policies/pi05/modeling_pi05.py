@@ -16,6 +16,7 @@
 
 import builtins
 import logging
+import math
 from collections import deque
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict, Unpack
@@ -28,6 +29,7 @@ from lerobot.utils.import_utils import _transformers_available, require_package
 
 # Conditional import for type checking and lazy loading
 if TYPE_CHECKING or _transformers_available:
+    from transformers.cache_utils import DynamicCache
     from transformers.models.auto import CONFIG_MAPPING
     from transformers.models.gemma import modeling_gemma
 
@@ -39,6 +41,7 @@ if TYPE_CHECKING or _transformers_available:
     )
 else:
     CONFIG_MAPPING = None
+    DynamicCache = None
     modeling_gemma = None
     PiGemmaForCausalLM = None
     _gated_residual = None
@@ -49,26 +52,193 @@ from lerobot.utils.constants import (
     ACTION,
     OBS_LANGUAGE_ATTENTION_MASK,
     OBS_LANGUAGE_TOKENS,
+    OPENPI_ATTENTION_MASK_VALUE,
 )
 
-from ..common.flow_matching import euler_integrate, sample_noise, sample_time_beta
-from ..common.vla_utils import (
-    clone_past_key_values,
-    create_sinusoidal_pos_embedding,
-    make_att_2d_masks,
-    pad_vector,
-    prepare_attention_masks_4d,
-    resize_with_pad_torch,
-)
 from ..pretrained import PreTrainedPolicy, T
 from ..rtc.modeling_rtc import RTCProcessor
 from .configuration_pi05 import DEFAULT_IMAGE_SIZE, PI05Config
+from .flow_sde import (
+    FlowSDETrace,
+    flow_ode_transition_mean,
+    flow_sde_transition_parameters,
+    gaussian_transition_log_prob,
+    make_flow_timesteps,
+    sample_flow_sde_transition,
+)
 
 
 class ActionSelectKwargs(TypedDict, total=False):
     inference_delay: int | None
     prev_chunk_left_over: Tensor | None
     execution_horizon: int | None
+
+
+def get_safe_dtype(target_dtype, device_type):
+    """Get a safe dtype for the given device type."""
+    if device_type == "mps" and target_dtype == torch.float64:
+        return torch.float32
+    if device_type == "cpu":
+        # CPU doesn't support bfloat16, use float32 instead
+        if target_dtype == torch.bfloat16:
+            return torch.float32
+        if target_dtype == torch.float64:
+            return torch.float64
+    return target_dtype
+
+
+def create_sinusoidal_pos_embedding(  # see openpi `create_sinusoidal_pos_embedding` (exact copy)
+    time: torch.Tensor, dimension: int, min_period: float, max_period: float, device="cpu"
+) -> Tensor:
+    """Computes sine-cosine positional embedding vectors for scalar positions."""
+    if dimension % 2 != 0:
+        raise ValueError(f"dimension ({dimension}) must be divisible by 2")
+
+    if time.ndim != 1:
+        raise ValueError("The time tensor is expected to be of shape `(batch_size, )`.")
+
+    dtype = get_safe_dtype(torch.float64, device.type)
+    fraction = torch.linspace(0.0, 1.0, dimension // 2, dtype=dtype, device=device)
+    period = min_period * (max_period / min_period) ** fraction
+
+    # Compute the outer product
+    scaling_factor = 1.0 / period * 2 * math.pi
+    sin_input = scaling_factor[None, :] * time[:, None]
+    return torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=1)
+
+
+def sample_beta(alpha, beta, bsize, device):  # see openpi `sample_beta` (exact copy)
+    # Beta sampling uses _sample_dirichlet which isn't implemented for MPS, so sample on CPU
+    alpha_t = torch.tensor(alpha, dtype=torch.float32)
+    beta_t = torch.tensor(beta, dtype=torch.float32)
+    dist = torch.distributions.Beta(alpha_t, beta_t)
+    return dist.sample((bsize,)).to(device)
+
+
+def make_att_2d_masks(pad_masks, att_masks):  # see openpi `make_att_2d_masks` (exact copy)
+    """Copied from big_vision.
+
+    Tokens can attend to valid inputs tokens which have a cumulative mask_ar
+    smaller or equal to theirs. This way `mask_ar` int[B, N] can be used to
+    setup several types of attention, for example:
+
+      [[1 1 1 1 1 1]]: pure causal attention.
+
+      [[0 0 0 1 1 1]]: prefix-lm attention. The first 3 tokens can attend between
+          themselves and the last 3 tokens have a causal attention. The first
+          entry could also be a 1 without changing behaviour.
+
+      [[1 0 1 0 1 0 0 1 0 0]]: causal attention between 4 blocks. Tokens of a
+          block can attend all previous blocks and all tokens on the same block.
+
+    Args:
+      input_mask: bool[B, N] true if its part of the input, false if padding.
+      mask_ar: int32[B, N] mask that's 1 where previous tokens cannot depend on
+        it and 0 where it shares the same attention mask as the previous token.
+    """
+    if att_masks.ndim != 2:
+        raise ValueError(att_masks.ndim)
+    if pad_masks.ndim != 2:
+        raise ValueError(pad_masks.ndim)
+
+    cumsum = torch.cumsum(att_masks, dim=1)
+    att_2d_masks = cumsum[:, None, :] <= cumsum[:, :, None]
+    pad_2d_masks = pad_masks[:, None, :] * pad_masks[:, :, None]
+    return att_2d_masks & pad_2d_masks
+
+
+def clone_past_key_values(past_key_values):
+    """Clone the DynamicCache returned by prefix prefill for compiled denoising."""
+    return DynamicCache(
+        tuple(
+            (keys.clone(), values.clone(), sliding_window) for keys, values, sliding_window in past_key_values
+        )
+    )
+
+
+def pad_vector(vector, new_dim):
+    """Pad the last dimension of a vector to new_dim with zeros.
+
+    Can be (batch_size x sequence_length x features_dimension)
+    or (batch_size x features_dimension)
+    """
+    if vector.shape[-1] >= new_dim:
+        return vector
+    return F.pad(vector, (0, new_dim - vector.shape[-1]))
+
+
+def resize_with_pad_torch(  # see openpi `resize_with_pad_torch` (exact copy)
+    images: torch.Tensor,
+    height: int,
+    width: int,
+    mode: str = "bilinear",
+) -> torch.Tensor:
+    """PyTorch version of resize_with_pad. Resizes an image to a target height and width without distortion
+    by padding with black. If the image is float32, it must be in the range [-1, 1].
+
+    Args:
+        images: Tensor of shape [*b, h, w, c] or [*b, c, h, w]
+        height: Target height
+        width: Target width
+        mode: Interpolation mode ('bilinear', 'nearest', etc.)
+
+    Returns:
+        Resized and padded tensor with same shape format as input
+    """
+    # Check if input is in channels-last format [*b, h, w, c] or channels-first [*b, c, h, w]
+    if images.shape[-1] <= 4:  # Assume channels-last format
+        channels_last = True
+        if images.dim() == 3:
+            images = images.unsqueeze(0)  # Add batch dimension
+        images = images.permute(0, 3, 1, 2)  # [b, h, w, c] -> [b, c, h, w]
+    else:
+        channels_last = False
+        if images.dim() == 3:
+            images = images.unsqueeze(0)  # Add batch dimension
+
+    batch_size, channels, cur_height, cur_width = images.shape
+
+    # Calculate resize ratio
+    ratio = max(cur_width / width, cur_height / height)
+    resized_height = int(cur_height / ratio)
+    resized_width = int(cur_width / ratio)
+
+    # Resize
+    resized_images = F.interpolate(
+        images,
+        size=(resized_height, resized_width),
+        mode=mode,
+        align_corners=False if mode == "bilinear" else None,
+    )
+
+    # Handle dtype-specific clipping
+    if images.dtype == torch.uint8:
+        resized_images = torch.round(resized_images).clamp(0, 255).to(torch.uint8)
+    elif images.dtype == torch.float32:
+        resized_images = resized_images.clamp(0.0, 1.0)
+    else:
+        raise ValueError(f"Unsupported image dtype: {images.dtype}")
+
+    # Calculate padding
+    pad_h0, remainder_h = divmod(height - resized_height, 2)
+    pad_h1 = pad_h0 + remainder_h
+    pad_w0, remainder_w = divmod(width - resized_width, 2)
+    pad_w1 = pad_w0 + remainder_w
+
+    # Pad
+    constant_value = 0 if images.dtype == torch.uint8 else 0.0
+    padded_images = F.pad(
+        resized_images,
+        (pad_w0, pad_w1, pad_h0, pad_h1),  # left, right, top, bottom
+        mode="constant",
+        value=constant_value,
+    )
+
+    # Convert back to original format if needed
+    if channels_last:
+        padded_images = padded_images.permute(0, 2, 3, 1)  # [b, c, h, w] -> [b, h, w, c]
+
+    return padded_images
 
 
 # Define the complete layer computation function for gradient checkpointing
@@ -467,18 +637,26 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             )
         return func(*args, **kwargs)
 
+    def _prepare_attention_masks_4d(self, att_2d_masks):
+        """Helper method to prepare 4D attention masks for transformer."""
+        att_2d_masks_4d = att_2d_masks[:, None, :, :]
+        return torch.where(att_2d_masks_4d, 0.0, OPENPI_ATTENTION_MASK_VALUE)
+
     def sample_noise(self, shape, device):
-        return sample_noise(shape, device)
+        return torch.normal(
+            mean=0.0,
+            std=1.0,
+            size=shape,
+            dtype=torch.float32,
+            device=device,
+        )
 
     def sample_time(self, bsize, device):
-        return sample_time_beta(
-            bsize,
-            device,
-            alpha=self.config.time_sampling_beta_alpha,
-            beta=self.config.time_sampling_beta_beta,
-            scale=self.config.time_sampling_scale,
-            offset=self.config.time_sampling_offset,
+        time_beta = sample_beta(
+            self.config.time_sampling_beta_alpha, self.config.time_sampling_beta_beta, bsize, device
         )
+        time = time_beta * self.config.time_sampling_scale + self.config.time_sampling_offset
+        return time.to(dtype=torch.float32, device=device)
 
     def embed_prefix(
         self, images, img_masks, tokens, masks
@@ -524,6 +702,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
     def embed_suffix(self, noisy_actions, timestep):
         """Embed noisy_actions, timestep to prepare for Expert Gemma processing."""
+        embs = []
+        pad_masks = []
         att_masks = []
 
         # Embed timestep using sine-cosine positional encoding
@@ -549,17 +729,52 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             return F.silu(x)
 
         time_emb = self._apply_checkpoint(time_mlp_func, time_emb)
+        action_time_emb = action_emb
         adarms_cond = time_emb
 
-        bsize, action_time_dim = action_emb.shape[:2]
-        pad_masks = torch.ones(bsize, action_time_dim, dtype=torch.bool, device=timestep.device)
+        embs.append(action_time_emb)
+        bsize, action_time_dim = action_time_emb.shape[:2]
+        action_time_mask = torch.ones(bsize, action_time_dim, dtype=torch.bool, device=timestep.device)
+        pad_masks.append(action_time_mask)
 
         # Set attention masks so that image, language and state inputs do not attend to action tokens
         att_masks += [1] + ([0] * (self.config.chunk_size - 1))
-        att_masks = torch.tensor(att_masks, dtype=action_emb.dtype, device=action_emb.device)
+
+        embs = torch.cat(embs, dim=1)
+        pad_masks = torch.cat(pad_masks, dim=1)
+        att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=embs.device)
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
 
-        return action_emb, pad_masks, att_masks, adarms_cond
+        return embs, pad_masks, att_masks, adarms_cond
+
+    @torch.no_grad()
+    def _build_prefix_cache(self, images, img_masks, tokens, masks):
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+        vlm = self.paligemma_with_expert.paligemma
+        vlm.model.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+        was_training = vlm.training
+        vlm.eval()
+        try:
+            (prefix_output, _), past_key_values = self.paligemma_with_expert.forward(
+                attention_mask=prefix_att_2d_masks_4d,
+                position_ids=prefix_position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, None],
+                use_cache=True,
+            )
+        finally:
+            vlm.train(was_training)
+        return prefix_output, prefix_pad_masks, past_key_values
+
+    @staticmethod
+    def _pool_prefix_features(prefix_output: Tensor, prefix_pad_masks: Tensor) -> Tensor:
+        """Pool valid VLM prefix tokens for the pi0.5 observation-value critic."""
+        mask = prefix_pad_masks.to(prefix_output.dtype).unsqueeze(-1)
+        denominator = mask.sum(dim=1).clamp_min(1)
+        return (prefix_output * mask).sum(dim=1).div(denominator).to(torch.float32)
 
     def forward(self, images, img_masks, tokens, masks, actions, noise, time) -> Tensor:
         """Do a full training forward pass and compute the loss."""
@@ -583,7 +798,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
 
-        att_2d_masks_4d = prepare_attention_masks_4d(att_2d_masks)
+        att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
 
         def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
             (_, suffix_out), _ = self.paligemma_with_expert.forward(
@@ -641,7 +856,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
-        prefix_att_2d_masks_4d = prepare_attention_masks_4d(prefix_att_2d_masks)
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
         self.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = "eager"  # noqa: SLF001
 
         _, past_key_values = self.paligemma_with_expert.forward(
@@ -652,21 +867,181 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             use_cache=True,
         )
 
-        return euler_integrate(
-            lambda input_x_t, current_timestep: self.denoise_step(
-                prefix_pad_masks=prefix_pad_masks,
-                past_key_values=past_key_values,
-                x_t=input_x_t,
-                timestep=current_timestep,
-            ),
-            noise,
-            num_steps,
-            rtc_processor=self.rtc_processor,
-            rtc_enabled=self._rtc_enabled(),
-            inference_delay=kwargs.get("inference_delay"),
-            prev_chunk_left_over=kwargs.get("prev_chunk_left_over"),
-            execution_horizon=kwargs.get("execution_horizon"),
+        dt = -1.0 / num_steps
+
+        x_t = noise
+        for step in range(num_steps):
+            time = 1.0 + step * dt
+            time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
+
+            def denoise_step_partial_call(input_x_t, current_timestep=time_tensor):
+                return self.denoise_step(
+                    prefix_pad_masks=prefix_pad_masks,
+                    past_key_values=past_key_values,
+                    x_t=input_x_t,
+                    timestep=current_timestep,
+                )
+
+            if self._rtc_enabled():
+                inference_delay = kwargs.get("inference_delay")
+                prev_chunk_left_over = kwargs.get("prev_chunk_left_over")
+                execution_horizon = kwargs.get("execution_horizon")
+
+                v_t = self.rtc_processor.denoise_step(
+                    x_t=x_t,
+                    prev_chunk_left_over=prev_chunk_left_over,
+                    inference_delay=inference_delay,
+                    time=time,
+                    original_denoise_step_partial=denoise_step_partial_call,
+                    execution_horizon=execution_horizon,
+                )
+            else:
+                v_t = denoise_step_partial_call(x_t)
+
+            x_t = x_t + dt * v_t
+
+            if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
+                self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
+
+        return x_t
+
+    @torch.no_grad()
+    def sample_actions_with_flow_sde(
+        self,
+        images,
+        img_masks,
+        tokens,
+        masks,
+        noise=None,
+        num_steps=None,
+        noise_level=None,
+        action_dim=None,
+        prefix_horizon=None,
+        include_value_features=True,
+    ) -> tuple[Tensor, FlowSDETrace]:
+        """Sample a full chunk with exactly one randomly selected Flow-SDE transition."""
+        if self._rtc_enabled():
+            raise ValueError("Hybrid Flow-SDE sampling cannot be combined with RTC")
+        if num_steps is None:
+            num_steps = self.config.num_inference_steps
+        if noise_level is None:
+            noise_level = self.config.flow_sde_noise_level
+        if action_dim is None:
+            action_dim = self.config.max_action_dim
+        if prefix_horizon is None:
+            prefix_horizon = self.config.chunk_size
+
+        bsize = tokens.shape[0]
+        device = tokens.device
+        if noise is None:
+            noise = self.sample_noise((bsize, self.config.chunk_size, self.config.max_action_dim), device)
+
+        prefix_output, prefix_pad_masks, past_key_values = self._build_prefix_cache(
+            images, img_masks, tokens, masks
         )
+        value_features = (
+            self._pool_prefix_features(prefix_output, prefix_pad_masks)
+            if include_value_features
+            else None
+        )
+        timesteps = make_flow_timesteps(num_steps, device=device, dtype=torch.float32)
+        stochastic_steps = torch.randint(num_steps, (bsize,), device=device)
+        transition_noise = self.sample_noise(noise.shape, device)
+
+        x_t = noise
+        trace_x_before = torch.empty_like(x_t)
+        trace_x_after = torch.empty_like(x_t)
+        trace_timestep = torch.empty(bsize, device=device, dtype=timesteps.dtype)
+        trace_next_timestep = torch.empty_like(trace_timestep)
+        trace_mean = torch.empty_like(x_t)
+        trace_std = torch.empty_like(x_t)
+        for step in range(num_steps):
+            timestep = timesteps[step].expand(bsize)
+            next_timestep = timesteps[step + 1].expand(bsize)
+            v_t = self.denoise_step(prefix_pad_masks, past_key_values, x_t, timestep)
+            ode_next = flow_ode_transition_mean(x_t, v_t, timestep, next_timestep)
+            sde_next, mean, std = sample_flow_sde_transition(
+                x_t,
+                v_t,
+                timestep,
+                next_timestep,
+                noise_level,
+                transition_noise,
+            )
+            selected = stochastic_steps == step
+            selected_action = selected[:, None, None]
+            trace_x_before = torch.where(selected_action, x_t, trace_x_before)
+            trace_x_after = torch.where(selected_action, sde_next, trace_x_after)
+            trace_mean = torch.where(selected_action, mean, trace_mean)
+            trace_std = torch.where(selected_action, std, trace_std)
+            trace_timestep = torch.where(selected, timestep, trace_timestep)
+            trace_next_timestep = torch.where(selected, next_timestep, trace_next_timestep)
+            x_t = torch.where(selected_action, sde_next, ode_next)
+
+        old_log_prob = gaussian_transition_log_prob(
+            trace_x_after,
+            trace_mean,
+            trace_std,
+            action_dim=action_dim,
+            prefix_horizon=prefix_horizon,
+        )
+        trace = FlowSDETrace(
+            x_before=trace_x_before,
+            x_after=trace_x_after,
+            timestep=trace_timestep,
+            next_timestep=trace_next_timestep,
+            step_index=stochastic_steps,
+            num_steps=num_steps,
+            noise_level=float(noise_level),
+            action_dim=action_dim,
+            prefix_horizon=prefix_horizon,
+            old_log_prob=old_log_prob,
+            value_features=value_features,
+        )
+        return x_t, trace.detach(cpu=True)
+
+    def compute_flow_sde_log_prob(
+        self,
+        images,
+        img_masks,
+        tokens,
+        masks,
+        trace: FlowSDETrace,
+        *,
+        prefix_horizon: int | None = None,
+    ) -> Tensor:
+        """Differentiably recompute a stored Flow-SDE transition's current log-probability."""
+        if self._rtc_enabled():
+            raise ValueError("Hybrid Flow-SDE log-probability cannot be combined with RTC")
+        device = tokens.device
+        trace = trace.to(device)
+        _, prefix_pad_masks, past_key_values = self._build_prefix_cache(images, img_masks, tokens, masks)
+        velocity = self.denoise_step(
+            prefix_pad_masks,
+            past_key_values,
+            trace.x_before,
+            trace.timestep,
+        )
+        mean, std = flow_sde_transition_parameters(
+            trace.x_before,
+            velocity,
+            trace.timestep,
+            trace.next_timestep,
+            trace.noise_level,
+        )
+        return gaussian_transition_log_prob(
+            trace.x_after,
+            mean,
+            std,
+            action_dim=trace.action_dim,
+            prefix_horizon=trace.prefix_horizon if prefix_horizon is None else prefix_horizon,
+        )
+
+    @torch.no_grad()
+    def compute_value_features(self, images, img_masks, tokens, masks) -> Tensor:
+        """Return pooled frozen-VLM prefix features for an observation-value head."""
+        prefix_output, prefix_pad_masks, _ = self._build_prefix_cache(images, img_masks, tokens, masks)
+        return self._pool_prefix_features(prefix_output, prefix_pad_masks)
 
     def denoise_step(
         self,
@@ -689,7 +1064,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
         position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
 
-        full_att_2d_masks_4d = prepare_attention_masks_4d(full_att_2d_masks)
+        full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
         self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
 
         past_key_values = clone_past_key_values(past_key_values)
@@ -713,9 +1088,6 @@ class PI05Policy(PreTrainedPolicy):
 
     config_class = PI05Config
     name = "pi05"
-
-    def supports_rtc(self) -> bool:
-        return True
 
     def __init__(
         self,
@@ -1055,6 +1427,66 @@ class PI05Policy(PreTrainedPolicy):
 
         return actions
 
+    @torch.no_grad()
+    def predict_action_chunk_with_flow_sde(
+        self,
+        batch: dict[str, Tensor],
+        *,
+        noise: Tensor | None = None,
+        num_steps: int | None = None,
+        noise_level: float | None = None,
+        prefix_horizon: int | None = None,
+        include_value_features: bool = True,
+    ) -> tuple[Tensor, FlowSDETrace]:
+        """Predict a complete action chunk and retain its one stochastic transition."""
+        self.eval()
+        images, img_masks = self._preprocess_images(batch)
+        tokens, masks = batch[OBS_LANGUAGE_TOKENS], batch[OBS_LANGUAGE_ATTENTION_MASK]
+        action_dim = self.config.output_features[ACTION].shape[0]
+        if prefix_horizon is None:
+            prefix_horizon = self.config.n_action_steps
+
+        actions, trace = self.model.sample_actions_with_flow_sde(
+            images,
+            img_masks,
+            tokens,
+            masks,
+            noise=noise,
+            num_steps=num_steps,
+            noise_level=noise_level,
+            action_dim=action_dim,
+            prefix_horizon=prefix_horizon,
+            include_value_features=include_value_features,
+        )
+        return actions[:, :, :action_dim], trace
+
+    def compute_flow_sde_log_prob(
+        self,
+        batch: dict[str, Tensor],
+        trace: FlowSDETrace,
+        *,
+        prefix_horizon: int | None = None,
+    ) -> Tensor:
+        """Differentiably evaluate a rollout trace under the policy's current parameters."""
+        images, img_masks = self._preprocess_images(batch)
+        tokens, masks = batch[OBS_LANGUAGE_TOKENS], batch[OBS_LANGUAGE_ATTENTION_MASK]
+        return self.model.compute_flow_sde_log_prob(
+            images,
+            img_masks,
+            tokens,
+            masks,
+            trace,
+            prefix_horizon=prefix_horizon,
+        )
+
+    @torch.no_grad()
+    def compute_value_features(self, batch: dict[str, Tensor]) -> Tensor:
+        """Return pooled VLM-prefix features for an external PPO value head."""
+        self.eval()
+        images, img_masks = self._preprocess_images(batch)
+        tokens, masks = batch[OBS_LANGUAGE_TOKENS], batch[OBS_LANGUAGE_ATTENTION_MASK]
+        return self.model.compute_value_features(images, img_masks, tokens, masks)
+
     def forward(self, batch: dict[str, Tensor], reduction: str = "mean") -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training.
 
@@ -1097,9 +1529,7 @@ class PI05Policy(PreTrainedPolicy):
 
     def _get_default_peft_targets(self) -> dict[str, any]:
         """Return default PEFT target modules for PI0.5 fine-tuning."""
-        common_projections = (
-            "state_proj|action_in_proj|action_out_proj|action_time_mlp_in|action_time_mlp_out"
-        )
+        common_projections = "action_in_proj|action_out_proj|time_mlp_in|time_mlp_out"
         target_modules = rf"(.*\.gemma_expert\..*\.self_attn\.(q|v)_proj|model\.({common_projections}))"
         return {
             "target_modules": target_modules,

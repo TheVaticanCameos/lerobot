@@ -48,6 +48,8 @@ class PI05Config(PreTrainedConfig):
     time_sampling_offset: float = 0.001
     min_period: float = 4e-3
     max_period: float = 4.0
+    # Noise scale used by the optional Flow-SDE PPO sampler.
+    flow_sde_noise_level: float = 0.5
 
     # Relative actions: converts absolute actions to relative (relative to state).
     use_relative_actions: bool = False
@@ -120,6 +122,11 @@ class PI05Config(PreTrainedConfig):
 
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
+
+        if self.flow_sde_noise_level <= 0:
+            raise ValueError(
+                f"flow_sde_noise_level must be positive, got {self.flow_sde_noise_level}"
+            )
 
     def validate_features(self) -> None:
         """Validate and set up input/output features."""
