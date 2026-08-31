@@ -37,7 +37,6 @@ ACTION_HIGH = 1.0
 DEFAULT_CONTROL_FREQ = 20
 DEFAULT_EPISODE_LENGTH = 300
 DEFAULT_NUM_STEPS_WAIT = 10
-DEFAULT_SUCCESS_HOLD_STEPS = 3
 
 DEFAULT_CAMERA_NAME = "agentview_image,robot0_eye_in_hand_image"
 DEFAULT_CAMERA_NAME_MAPPING = {
@@ -572,7 +571,6 @@ class PickPlaceEnv(gym.Env):
         control_freq: int = DEFAULT_CONTROL_FREQ,
         control_mode: str = "relative",
         hard_reset: bool = True,
-        success_hold_steps: int = DEFAULT_SUCCESS_HOLD_STEPS,
     ):
         super().__init__()
 
@@ -591,8 +589,6 @@ class PickPlaceEnv(gym.Env):
             raise ValueError("episode_length must be positive")
         if num_steps_wait < 0:
             raise ValueError("num_steps_wait must be non-negative")
-        if success_hold_steps <= 0:
-            raise ValueError("success_hold_steps must be positive")
         validate_control_mode(control_mode)
 
         self.task_suite = task_suite
@@ -631,7 +627,6 @@ class PickPlaceEnv(gym.Env):
         self.control_freq = control_freq
         self.control_mode = control_mode
         self.hard_reset = hard_reset
-        self.success_hold_steps = success_hold_steps
         self.episode_length = episode_length
         if episode_length is not None:
             self._max_episode_steps = episode_length
@@ -653,7 +648,6 @@ class PickPlaceEnv(gym.Env):
         self._env: OffScreenRenderEnv | None = None
         self._pending_reset_render: np.ndarray | None = None
         self._episode_step = 0
-        self._success_streak = 0
         self._target_initial_pos: np.ndarray | None = None
 
         images: dict[str, spaces.Box] = {}
@@ -760,6 +754,11 @@ class PickPlaceEnv(gym.Env):
             "camera_heights": self.observation_height,
             "camera_widths": self.observation_width,
             "control_freq": self.control_freq,
+            # Let this Gymnasium wrapper own termination.  LIBERO's BDDL
+            # layer marks the underlying robosuite episode done as soon as
+            # the object enters the receptacle, before the wrapper can return
+            # its is_success flag consistently to the controller.
+            "ignore_done": True,
             "hard_reset": self.hard_reset,
         }
         if self.scene.arena_xml is not None:
@@ -1000,45 +999,12 @@ class PickPlaceEnv(gym.Env):
         qpos = raw_obs.get("robot0_gripper_qpos")
         if qpos is None:
             return False
-        # Robosuite's parallel gripper qpos is positive when opening.  Keep
-        # this threshold conservative; it can be tuned after observing the
-        # actual controller range.
-        return bool(float(np.mean(qpos)) > 0.02)
-
-    def _check_pick_success(self) -> bool:
-        target_pos = self._body_position(self._task_spec.target_object)
-        if self._target_initial_pos is None:
-            return False
-        # A pick is considered successful after the target is lifted clear of
-        # the tabletop.  The object must also be reasonably stationary so a
-        # transient collision is not counted as success.
-        lifted = target_pos[2] > self._target_initial_pos[2] + 0.04
-        _, linear_speed = self._body_speed(self._task_spec.target_object)
-        return bool(lifted and linear_speed < 0.25)
-
-    def _check_place_success(self) -> bool:
-        if self._task_spec.receptacle is None:
-            return False
-
-        target_inside = self._is_object_inside_containment_site(
-            self._task_spec.target_object,
-            self._task_spec.receptacle,
-        )
-        _, linear_speed = self._body_speed(self._task_spec.target_object)
-        angular_speed, _ = self._body_speed(self._task_spec.target_object)
-        stable = linear_speed < 0.05 and angular_speed < 0.2
-        valid = target_inside and self._is_gripper_released() and stable
-        self._success_streak = self._success_streak + 1 if valid else 0
-        return self._success_streak >= self.success_hold_steps
-
-    def _check_task_success(self) -> bool:
-        if self._task_spec.success_type == "pick":
-            return self._check_pick_success()
-        if self._task_spec.success_type == "place":
-            return self._check_place_success()
-        raise ValueError(
-            f"Unknown success type '{self._task_spec.success_type}'"
-        )
+        # Panda's two finger joints move symmetrically, so their qpos values
+        # have opposite signs (approximately ``[q, -q]``).  Averaging them
+        # would therefore always produce a value close to zero and report a
+        # fully open gripper as closed.  Use the magnitude of either finger
+        # instead.
+        return bool(float(np.max(np.abs(np.asarray(qpos, dtype=np.float64)))) > 0.02)
 
     def reset(self, seed=None, **kwargs):
         self._ensure_env()
@@ -1076,7 +1042,6 @@ class PickPlaceEnv(gym.Env):
 
         self._set_control_mode()
         self._episode_step = 0
-        self._success_streak = 0
         self._target_initial_pos = self._body_position(
             self._task_spec.target_object
         )
@@ -1103,7 +1068,7 @@ class PickPlaceEnv(gym.Env):
 
         raw_obs, reward, simulator_done, info = self._env.step(action)
         self._episode_step += 1
-        is_success = self._check_task_success()
+        is_success = bool(self._env.check_success())
         terminated = bool(simulator_done or is_success)
         truncated = bool(
             self._episode_step >= self._max_episode_steps and not terminated

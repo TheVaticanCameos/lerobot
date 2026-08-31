@@ -920,7 +920,6 @@ class CustomPickPlaceEnvConfig(EnvConfig):
     observation_height: int = 256
     observation_width: int = 256
     control_mode: str = "relative"
-    success_hold_steps: int = 3
     features: dict[str, PolicyFeature] = field(
         default_factory=lambda: {
             ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,)),
@@ -948,8 +947,6 @@ class CustomPickPlaceEnvConfig(EnvConfig):
             raise ValueError("hard_reset=False requires init_states=True")
         if self.num_steps_wait < 0:
             raise ValueError("num_steps_wait must be non-negative")
-        if self.success_hold_steps <= 0:
-            raise ValueError("success_hold_steps must be positive")
         self._add_visual_features()
         self._add_policy_state_feature()
         self._update_camera_feature_mapping()
@@ -992,7 +989,6 @@ class CustomPickPlaceEnvConfig(EnvConfig):
             "control_freq": self.fps,
             "hard_reset": self.hard_reset,
             "num_steps_wait": self.num_steps_wait,
-            "success_hold_steps": self.success_hold_steps,
         }
         if self.task_ids is not None:
             kwargs["task_ids"] = self.task_ids

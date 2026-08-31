@@ -772,6 +772,18 @@ def eval_main(cfg: EvalPipelineConfig):
         "device_processor": {"device": str(policy.config.device)},
         "rename_observations_processor": {"rename_map": cfg.rename_map},
     }
+    # A pretrained PI0Fast checkpoint may reference an action tokenizer by its
+    # original Hub ID.  When evaluating offline, users can override the policy
+    # tokenizer with a local snapshot path; propagate that override to the
+    # serialized action-tokenizer processor as well.
+    if getattr(cfg.policy, "action_tokenizer_name", None):
+        preprocessor_overrides["action_tokenizer_processor"] = {
+            "action_tokenizer_name": cfg.policy.action_tokenizer_name,
+        }
+    if getattr(cfg.policy, "text_tokenizer_name", None):
+        preprocessor_overrides["tokenizer_processor"] = {
+            "tokenizer_name": cfg.policy.text_tokenizer_name,
+        }
 
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=cfg.policy,
